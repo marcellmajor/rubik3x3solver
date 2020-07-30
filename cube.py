@@ -1,3 +1,6 @@
+#!python
+#cython: language_level=3
+
 from solution import *
 import colorama
 #import sty
@@ -153,6 +156,107 @@ class Cube(object):
                     _counter += 3
             _ret_counter += _counter
         return _ret_counter
+
+    def count_same_as_center(self):
+        faces = [
+            self.top_face,
+            self.row_of_faces[0],
+            self.row_of_faces[1],
+            self.row_of_faces[2],
+            self.row_of_faces[3],
+            self.bottom_face
+            ]
+        _counter = 0
+        for _face in faces:
+            i = 0
+            for _color in _face:
+                if _color == _face[4]:
+                    _counter += 1 + (i % 2)
+                i += 1
+        return _counter
+
+
+    def count_triangles(self):
+        faces = [
+            self.top_face,
+            self.row_of_faces[0],
+            self.row_of_faces[1],
+            self.row_of_faces[2],
+            self.row_of_faces[3],
+            self.bottom_face
+            ]
+        _counter = 0
+        for _face in faces:
+            if _face[0] == _face[1] == _face[2] == _face[4]:
+                _counter += 1
+            if _face[6] == _face[7] == _face[8] == _face[4]:
+                _counter += 1
+            if _face[0] == _face[3] == _face[6] == _face[4]:
+                _counter += 1
+            if _face[2] == _face[5] == _face[8] == _face[4]:
+                _counter += 1
+        return _counter
+
+    def count_pieces_in_place(self):
+        _counter = 0
+        # white cross
+        if self.row_of_faces[2][4] == "W":
+            _counter += 1
+        if _counter < 1:
+            return _counter
+        if self.row_of_faces[2][4] == self.row_of_faces[2][1] and self.top_face[4] == self.top_face[7]:
+            _counter += 1
+        if self.row_of_faces[2][4] == self.row_of_faces[2][3] and self.row_of_faces[1][4] == self.row_of_faces[1][5]:
+            _counter += 1
+        if self.row_of_faces[2][4] == self.row_of_faces[2][5] and self.row_of_faces[3][4] == self.row_of_faces[3][3]:
+            _counter += 1
+        if self.row_of_faces[2][4] == self.row_of_faces[2][7] and self.bottom_face[4] == self.bottom_face[1]:
+            _counter += 1
+        if _counter < 5:
+            return _counter
+        # second layer
+        if self.row_of_faces[2][4] == self.row_of_faces[2][0] and self.top_face[4] == self.top_face[6] and self.row_of_faces[1][4] == self.row_of_faces[1][2]:
+            _counter += 1
+        if self.row_of_faces[2][4] == self.row_of_faces[2][2] and self.top_face[4] == self.top_face[8] and self.row_of_faces[3][4] == self.row_of_faces[3][0]:
+            _counter += 1
+        if self.row_of_faces[2][4] == self.row_of_faces[2][6] and self.bottom_face[4] == self.bottom_face[0] and self.row_of_faces[1][4] == self.row_of_faces[1][8]:
+            _counter += 1
+        if self.row_of_faces[2][4] == self.row_of_faces[2][8] and self.bottom_face[4] == self.bottom_face[2] and self.row_of_faces[3][4] == self.row_of_faces[3][6]:
+            _counter += 1
+        if _counter < 9:
+            return _counter
+        # yellow cross
+        if self.row_of_faces[0][4] == self.row_of_faces[0][1] and self.top_face[4] == self.top_face[1]:
+            _counter += 1
+        if self.row_of_faces[0][4] == self.row_of_faces[0][3] and self.row_of_faces[3][4] == self.row_of_faces[3][5]:
+            _counter += 1
+        if self.row_of_faces[1][4] == self.row_of_faces[1][3] and self.row_of_faces[0][4] == self.row_of_faces[0][5]:
+            _counter += 1
+        if self.row_of_faces[0][4] == self.row_of_faces[0][7] and self.bottom_face[4] == self.bottom_face[7]:
+            _counter += 1
+        if _counter < 13:
+            return _counter
+        # yellow edges
+        if self.row_of_faces[0][4] == self.row_of_faces[0][0] and self.top_face[4] == self.top_face[2] and self.row_of_faces[3][4] == self.row_of_faces[3][2]:
+            _counter += 1
+        if self.row_of_faces[1][4] == self.row_of_faces[1][0] and self.top_face[4] == self.top_face[0] and self.row_of_faces[0][4] == self.row_of_faces[0][2]:
+            _counter += 1
+        if self.row_of_faces[0][4] == self.row_of_faces[0][6] and self.bottom_face[4] == self.bottom_face[8] and self.row_of_faces[3][4] == self.row_of_faces[3][8]:
+            _counter += 1
+        if self.row_of_faces[0][4] == self.row_of_faces[0][8] and self.bottom_face[4] == self.bottom_face[6] and self.row_of_faces[1][4] == self.row_of_faces[1][6]:
+            _counter += 1
+        if _counter < 17:
+            return _counter
+        # permute corners, orient corners
+        if self.row_of_faces[1][4] == self.row_of_faces[1][1] and self.top_face[4] == self.top_face[3]:
+            _counter += 1
+        if self.row_of_faces[1][4] == self.row_of_faces[1][7] and self.bottom_face[4] == self.bottom_face[3]:
+            _counter += 1
+        if self.row_of_faces[2][4] == self.row_of_faces[2][1] and self.top_face[4] == self.top_face[5]:
+            _counter += 1
+        if self.row_of_faces[3][4] == self.row_of_faces[3][7] and self.bottom_face[4] == self.bottom_face[5]:
+            _counter += 1
+        return _counter
 
     def print_colored(self):
         colorama.init()
