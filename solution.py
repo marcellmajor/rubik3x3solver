@@ -1,3 +1,6 @@
+#!python
+#cython: language_level=3
+
 from cube import *
 import random
 from enum import Enum
@@ -50,17 +53,22 @@ class Solution(object):
             _solved_faces, _solved_color = actual_cube.count_solved_faces(color)
 
             if _solved_faces >= 6:
-                #print("\n\nSolved!!! {}. : {}".format(str(i+1), test_chromosome[:((i+1)*2)]), end="\n\n")
-                # print solution
-                #actual_cube.print_colored()
+                print("\n\nSolved!!! {}. : {}".format(str(i+1), test_chromosome[:((i+1)*2)]), end="\n\n")
+                #print solution
+                actual_cube.print_colored()
                 _fitness = solved_fitness - i
                 _max_index = i
                 return _max_index, _fitness
 
-            _solved_edges = actual_cube.count_solved_edges(color)
+            #_solved_edges = actual_cube.count_solved_edges(color)
+            _same_as_center = actual_cube.count_same_as_center()
+            _triangles = actual_cube.count_triangles()
+
+            _pieces_in_place = actual_cube.count_pieces_in_place()
 
             #_new_fitness = _solved_color * 10000 + _solved_faces * 24 + _solved_edges - i / 50
-            _new_fitness = _solved_edges - i / 40
+            _new_fitness = _pieces_in_place + _solved_faces + _triangles + _same_as_center - i / 100
+            #_new_fitness = _pieces_in_place - i / 100
 
             if _fitness < _new_fitness:
                 _fitness = _new_fitness
@@ -166,14 +174,15 @@ class Solution(object):
                 i += 1
         return return_chromosome
 
-    def set_chromosome(self, new_chromosome):
+    def set_chromosome(self, new_chromosome, simplify = False):
         self.genes = new_chromosome
         while (len(self.genes) / 2) < self.max_genes:
             self.genes += "{}{}".format(
                     random.sample( gene_directions, 1 )[0],
                     random.randint( 1, max_rotation )
                 )
-        return
+        if not simplify:
+            return
         for i in range(1,self.max_genes):
             _prev_gene = self.genes[(i-1)*2:i*2]
             _act_gene = self.genes[i*2:(i+1)*2]
