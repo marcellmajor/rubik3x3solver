@@ -34,6 +34,11 @@ class Cube(object):
         self.row_of_faces = row_of_faces
         self.bottom_face = bottom_face
 
+    def set_faces( self, top_face, row_of_faces, bottom_face ):
+        self.top_face = top_face
+        self.row_of_faces = row_of_faces
+        self.bottom_face = bottom_face
+
     def rotate_right(self, count):
         for i in range(0,count):
             _factor = (2*block_size)

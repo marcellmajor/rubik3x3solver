@@ -18,6 +18,10 @@ class Solution(object):
         self.max_genes = number_of_genes
         self.genes = ""
 
+    def set_number_of_genes(self, number_of_genes = 16):
+        self.max_genes = number_of_genes
+        self.genes = ""
+
     def calculate_fitness(self, actual_cube, test_chromosome, stop_at = -1, mode = Mode.MAX, color="B" ):
         _fitness = 0
         _cumulated_fitness = 0
