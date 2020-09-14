@@ -22,7 +22,7 @@ class Solution(object):
         self.max_genes = number_of_genes
         self.genes = ""
 
-    def calculate_fitness(self, actual_cube, test_chromosome, stop_at = -1, mode = Mode.MAX, color="B" ):
+    def calculate_fitness(self, actual_cube, test_chromosome, stop_at = -1, mode = Mode.MAX, color="B", stop_when_solved = True ):
         _fitness = 0
         _cumulated_fitness = 0
         _last_fitness = 0
@@ -56,7 +56,7 @@ class Solution(object):
 
             _solved_faces, _solved_color = actual_cube.count_solved_faces(color)
 
-            if _solved_faces >= 6:
+            if _solved_faces >= 6 and stop_when_solved:
                 print("\n\nSolved!!! {}. : {}".format(str(i+1), test_chromosome[:((i+1)*2)]), end="\n\n")
                 #print solution
                 actual_cube.print_colored()

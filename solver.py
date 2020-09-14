@@ -13,6 +13,7 @@ class Processing(Enum):
     SINGLE_THREAD = 1
     MULTI_THREAD = 2
     MULTI_PROCESSING = 3
+    MEET_IN_THE_MIDDLE = 4
 
 def main():
     chromosome_size = 24
@@ -22,9 +23,9 @@ def main():
     my_solution.generate_random_genes()
     print("Initial chromosome: ", my_solution.get_chromosome())
     my_cube = Cube(
-        "OROYBWOWR",
-        ["BYBWYGWBO","YGGROYGOY","WBGOWYRWW","YGWBROBOG"],
-        "BRRBGGYRR"
+        "GBRWORWOY",
+        ["GOORYWYRR","YBBOGGWGG","OYROWBOGB","GWWYBBYGO"],
+        "WRRWRYBYB"
     )
     my_cube.test_cube()
     my_cube.print_colored()
@@ -109,48 +110,50 @@ def main():
     # print("Fitness: ", _fitness)
     # exit(0)
 
-    N = 7
+    N = 6
+    JUST_READING = False
     print("\nSTART: calculating all possible combination of moves up to {}\n".format(N))
-    _move_combinations_set = set()
-    _length = 0
-    _counter = 0
-    while _length < N:
-        print("Deepcopy/list conversion...")
-        if _length == 0:
-            _previuos_combinations = list( [""] )
-        else:
-            _previuos_combinations = list( _move_combinations_set )
-        print("{}Counter: {}; N={}; _length={}".format(">"*_length,_counter, N, _length))
-        print("combinations:",len(_previuos_combinations))
-        _added_count = 0
-        for _act_combo in _previuos_combinations:
-            for _direction in gene_directions:
-                for _rotation in range( 1, max_rotation + 1 ):
-                    #gc.disable()
-                    _move_combinations_set.add(
-                        _act_combo + "{}{}".format(_direction, _rotation)
-                    )
-                    #Sgc.enable()
-                    _counter += 1
-                    _added_count += 1
-                    if _counter % 10000000 == 0:
-                        print("Counter: {}; N={}; _length={}".format(_counter, N, _length))
-        print("_added_count:",_added_count)
-        _length += 1
+    if not JUST_READING:
+        _move_combinations_set = set()
+        _length = 0
+        _counter = 0
+        while _length < N:
+            print("Deepcopy/list conversion...")
+            if _length == 0:
+                _previuos_combinations = list( [""] )
+            else:
+                _previuos_combinations = list( _move_combinations_set )
+            print("{}Counter: {}; N={}; _length={}".format(">"*_length,_counter, N, _length))
+            print("combinations:",len(_previuos_combinations))
+            _added_count = 0
+            for _act_combo in _previuos_combinations:
+                for _direction in gene_directions:
+                    for _rotation in range( 1, max_rotation + 1 ):
+                        #gc.disable()
+                        _move_combinations_set.add(
+                            _act_combo + "{}{}".format(_direction, _rotation)
+                        )
+                        #Sgc.enable()
+                        _counter += 1
+                        _added_count += 1
+                        if _counter % 10000000 == 0:
+                            print("Counter: {}; N={}; _length={}".format(_counter, N, _length))
+            print("_added_count:",_added_count)
+            _length += 1
+            gc.collect(2)
+        print("Counter:", _counter)
+        print("len(_move_combinations_set):", len(_move_combinations_set))
+        print("GC")
         gc.collect(2)
-    print("Counter:", _counter)
-    print("len(_move_combinations_set):", len(_move_combinations_set))
-    print("GC")
-    gc.collect(2)
-    print("WRITING")
-    fp = open("combinations.txt", "w")
-    for _line in _move_combinations_set:
-        fp.write(_line + "\n")
-    fp.close()
-    _move_combinations_set = {}
-    _previuos_combinations = {}
-    print("GC")
-    gc.collect(2)
+        print("WRITING")
+        fp = open("combinations.txt", "w")
+        for _line in _move_combinations_set:
+            fp.write(_line + "\n")
+        fp.close()
+        _move_combinations_set = {}
+        _previuos_combinations = {}
+        print("GC")
+        gc.collect(2)
     #_move_combinations = list( _move_combinations_set )
     print("READING")
     fp = open('combinations.txt', 'r')
@@ -165,7 +168,7 @@ def main():
             _move_combinations.append(line.strip())
         cnt += 1
         if cnt % 1000000 == 0:
-            print("Read count = ", cnt, end ="\r")
+            print("Read count = ", cnt, end="\r")
     fp.close()
     print("READ {} combinations".format(len(_move_combinations)))
     # _move_combinations.extend(
@@ -185,7 +188,7 @@ def main():
 
     _best_chromosome = ""
     _act_color_index = 4
-    _Processing_Mode = Processing.MULTI_PROCESSING
+    _Processing_Mode = Processing.MEET_IN_THE_MIDDLE
     if _Processing_Mode == Processing.MULTI_THREAD:
         class myThread (threading.Thread):
             def __init__(self, combinations, start_index, end_index, thread_index, cube):
@@ -328,6 +331,103 @@ def main():
         _genes = _best_chromosome
         _temp_cube = my_cube.clone()
         my_solution.calculate_fitness(_temp_cube, _genes, _best_index, mode = Mode.LAST)
+
+    elif _Processing_Mode == Processing.MEET_IN_THE_MIDDLE:
+        # saving combos from solved cube
+        if not JUST_READING: #only when there is no file
+            solved_cube = Cube(
+                "OOOOOOOOO",
+                ["YYYYYYYYY","GGGGGGGGG","WWWWWWWWW","BBBBBBBBB"],
+                "RRRRRRRRR"
+            )
+            _counter = 0
+            print("WRITING")
+            fp = open("combinations_solved.txt", "w")
+            for _act_combo in _move_combinations:
+                _act_cube = solved_cube.clone()
+                _act_solution = Solution( int( len( _act_combo ) / 2 ) )
+                _act_solution.calculate_fitness( _act_cube, _act_combo, mode = Mode.LAST, stop_when_solved = False )
+                if _counter % 10000 == 0:
+                    print("Progress: {:.2f}%".format(_counter/_num_combinations*100), end="\r")
+                _counter += 1
+                fp.write( _act_combo +":"
+                    + _act_cube.top_face
+                    + _act_cube.row_of_faces[0]
+                    + _act_cube.row_of_faces[1]
+                    + _act_cube.row_of_faces[2]
+                    + _act_cube.row_of_faces[3]
+                    + _act_cube.bottom_face + "\n" )
+            fp.close()
+        gc.collect(2)
+        # reading combos from solved cube
+        print("\nREADING")
+        _counter = 0
+        _max_fitness = 0
+        fp = open('combinations_solved.txt', 'r')
+        _solved_combinations = {}#set([])
+        line = fp.readline()
+        if len(line) > 0:
+            _moves, _act_cube_string = line.strip().split(":")
+            # _solved_combinations.add(_act_cube_string)
+            if not _act_cube_string in _solved_combinations:
+                _solved_combinations[_act_cube_string] = _moves
+            elif len(_solved_combinations[_act_cube_string]) > len(_moves):
+                _solved_combinations[_act_cube_string] = _moves
+        _counter += 1
+        while line:
+            line = fp.readline()
+            if len(line) > 0:
+                _moves, _act_cube_string = line.strip().split(":")
+                # _solved_combinations.add(_act_cube_string)
+                if not _act_cube_string in _solved_combinations:
+                    _solved_combinations[_act_cube_string] = _moves
+                elif len(_solved_combinations[_act_cube_string]) > len(_moves):
+                    _solved_combinations[_act_cube_string] = _moves
+            _counter += 1
+            if _counter % 10000 == 0:
+                print("Progress: {:.2f}%".format(_counter/_num_combinations*100), end="\r")
+        fp.close()
+        print("READ {} combinations of solved cube".format(len(_solved_combinations)))
+        gc.collect(2)
+        # calculating combos from actual cube and matching with loaded ones
+        print("MATCHING")
+        _counter = 0
+        for _act_combo in _move_combinations:
+            _act_cube = my_cube.clone()
+            _act_solution = Solution( int( len( _act_combo ) / 2 ) )
+            _act_solution.calculate_fitness( _act_cube, _act_combo, mode = Mode.LAST, stop_when_solved = False )
+            _act_cube_string = _act_cube.top_face \
+                + _act_cube.row_of_faces[0] \
+                + _act_cube.row_of_faces[1] \
+                + _act_cube.row_of_faces[2] \
+                + _act_cube.row_of_faces[3] \
+                + _act_cube.bottom_face
+            if _act_cube_string in _solved_combinations:
+                print("MATCH FOUND!!!")
+                _to_reverse = _solved_combinations[_act_cube_string]
+                print(_to_reverse)
+                f = lambda s,n:s and f(s[n:],n)+s[:n]
+                __reversed = f(_to_reverse, 2)
+                _reversed = ""
+                for i in range(len(__reversed)):
+                    if __reversed[i] == '1':
+                        _reversed += '3'
+                    elif __reversed[i] == '3':
+                        _reversed += '1'
+                    else:
+                        _reversed += __reversed[i]
+                print(_act_combo + "<=>" + _reversed)
+                _best_chromosome = _act_combo + _reversed
+                _max_fitness = solved_fitness
+                _length = int( len(_best_chromosome) / 2 )
+                _best_index = _max_fitness - 1
+                _test_cube = my_cube.clone()
+                _index, _fitness = my_solution.calculate_fitness(_test_cube,_best_chromosome, _best_index, color=colors[_act_color_index])
+                exit(0)
+                break
+            if _counter % 10000 == 0:
+                print("Progress: {:.2f}%".format(_counter/_num_combinations*100), end="\r")
+            _counter += 1
 
     elif _Processing_Mode == Processing.SINGLE_THREAD:
         print("\nSTART: trying to find best possible solution using precalculated move combinations\n")
