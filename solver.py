@@ -23,9 +23,9 @@ def main():
     my_solution.generate_random_genes()
     print("Initial chromosome: ", my_solution.get_chromosome())
     my_cube = Cube(
-        "GBRWORWOY",
-        ["GOORYWYRR","YBBOGGWGG","OYROWBOGB","GWWYBBYGO"],
-        "WRRWRYBYB"
+                                 "BRRBGYGGG",
+        ["GBRRRGRRB","YWWWWWRWW","OOOOOOOOO","YGWYYGYYG"],
+                                 "BBBRBBWYY"
     )
     my_cube.test_cube()
     my_cube.print_colored()
@@ -111,7 +111,7 @@ def main():
     # exit(0)
 
     N = 6
-    JUST_READING = False
+    JUST_READING = True # False
     print("\nSTART: calculating all possible combination of moves up to {}\n".format(N))
     if not JUST_READING:
         _move_combinations_set = set()
@@ -187,7 +187,7 @@ def main():
     print("Total number of combinations found:", _num_combinations)
 
     _best_chromosome = ""
-    _act_color_index = 4
+    _act_color_index = 3
     _Processing_Mode = Processing.MEET_IN_THE_MIDDLE
     if _Processing_Mode == Processing.MULTI_THREAD:
         class myThread (threading.Thread):
@@ -360,7 +360,7 @@ def main():
             fp.close()
         gc.collect(2)
         # reading combos from solved cube
-        print("\nREADING")
+        print("\nREADING---")
         _counter = 0
         _max_fitness = 0
         fp = open('combinations_solved.txt', 'r')
