@@ -1,0 +1,199 @@
+Bounded comparison: cooperative coevolution vs existing prefix GA
+==================================================================
+Generated: 2026-10-23T11:09:11+00:00 (started 2026-10-23T10:54:25+00:00)
+Command: benchmark_coevolution.py
+Specification: new_deap_implementation_specs_fixed.md, section 13 (bounded first-delivery comparison)
+
+1. Outcome
+----------
+- No run of either solver solved the active cube within its budget.
+- No run of either solver improved on the input cost H=24: every best verified attempt is the empty move list.
+- These are the only runs made for this report; no seed was rerun, dropped or selected.
+- Three seeds per solver describe observed behaviour on one cube. They are not a solve-probability estimate.
+
+2. Results per run (endpoint cost/solved status replayed independently from the original cube)
+------------------------------------------------------------------------------------------------
+solver             seed  status            stop reason         best H  solved  moves  unique endpoints  generations  search s  setup s  finalisation
+-----------------  ----  ----------------  ------------------  ------  ------  -----  ----------------  -----------  --------  -------  ------------
+new (coevolution)  42    BUDGET_EXHAUSTED  time limit reached  24      no      0      1/200             9473         120.0     0.1      0.0ms
+old (prefix GA)    42    BUDGET_EXHAUSTED  time limit reached  24      no      0      1/200             1897         120.0     0.7      0.0ms
+new (coevolution)  43    BUDGET_EXHAUSTED  time limit reached  24      no      0      1/200             9539         120.0     0.1      0.0ms
+old (prefix GA)    43    BUDGET_EXHAUSTED  time limit reached  24      no      0      1/200             1895         120.0     0.7      0.0ms
+new (coevolution)  44    BUDGET_EXHAUSTED  time limit reached  24      no      0      1/200             9411         120.0     0.2      0.0ms
+old (prefix GA)    44    BUDGET_EXHAUSTED  time limit reached  24      no      0      1/200             1900         120.0     0.7      0.0ms
+
+Input cube cost H (manhattan compatibility heuristic): 24. Move counts are reduced active
+lengths (a half turn counts as one move). Unique endpoints: distinct endpoint states in the last fully
+evaluated solution population (old solver: distinct best-prefix endpoints of its individuals).
+Search time is measured from immediately before population creation; old-solver search time
+excludes paused harness observation (see section 4).
+
+3. Best verified move sequences
+-------------------------------
+new seed 42: (empty move list) [empty baseline; never improved]
+old seed 42: (empty move list) [empty baseline; never improved]
+new seed 43: (empty move list) [empty baseline; never improved]
+old seed 43: (empty move list) [empty baseline; never improved]
+new seed 44: (empty move list) [empty baseline; never improved]
+old seed 44: (empty move list) [empty baseline; never improved]
+
+4. Work counters and timing diagnostics
+---------------------------------------
+new seed 42:
+  timing: setup 0.1s, search 120.00s, search wall 120.00s, finalisation 0.0ms, process wall 120.3s
+  H computations: 3415810
+  H cache hits: 12816727
+  quarter turns: 27911172
+  move applications: 13949542
+  cube clones: 4072962
+  normalisations: 1136761
+  independent replays: 1136761
+  block sequence evaluations: 653206
+  block evaluation cache hits: 294114
+  solution capacity rejections: 0
+  block oversized rejections: 62180
+  block-prefix capacity exclusions: 0
+  no-change offspring: 909408
+old seed 42:
+  timing: setup 0.7s, search 120.00s, search wall 173.53s, observation overhead 53.53s (excluded from budget), finalisation 0.0ms, process wall 174.3s
+  evaluations (one my_cube.clone() each): 340221
+  manhattan_distance calls: 11227310
+  misplaced_stickers calls: 11227310
+  rotate calls: 10887088
+  quarter turns: 21809105
+  harness normalisations (excluded from budget): 321309
+  harness observation cache hits: 398512
+new seed 43:
+  timing: setup 0.1s, search 120.00s, search wall 120.00s, finalisation 0.0ms, process wall 120.3s
+  H computations: 3441180
+  H cache hits: 12920400
+  quarter turns: 28153970
+  move applications: 14062679
+  cube clones: 4101608
+  normalisations: 1144681
+  independent replays: 1144681
+  block sequence evaluations: 658026
+  block evaluation cache hits: 295964
+  solution capacity rejections: 0
+  block oversized rejections: 62449
+  block-prefix capacity exclusions: 0
+  no-change offspring: 915744
+old seed 43:
+  timing: setup 0.7s, search 120.00s, search wall 173.45s, observation overhead 53.45s (excluded from budget), finalisation 0.0ms, process wall 174.3s
+  evaluations (one my_cube.clone() each): 340015
+  manhattan_distance calls: 11220497
+  misplaced_stickers calls: 11220497
+  rotate calls: 10880481
+  quarter turns: 21841063
+  harness normalisations (excluded from budget): 321145
+  harness observation cache hits: 398070
+new seed 44:
+  timing: setup 0.2s, search 120.00s, search wall 120.00s, finalisation 0.0ms, process wall 120.4s
+  H computations: 3395208
+  H cache hits: 12945076
+  quarter turns: 28166013
+  move applications: 14072231
+  cube clones: 4046970
+  normalisations: 1129321
+  independent replays: 1129321
+  block sequence evaluations: 649596
+  block evaluation cache hits: 291543
+  solution capacity rejections: 0
+  block oversized rejections: 61474
+  block-prefix capacity exclusions: 0
+  no-change offspring: 903456
+old seed 44:
+  timing: setup 0.7s, search 120.00s, search wall 173.23s, observation overhead 53.23s (excluded from budget), finalisation 0.0ms, process wall 174.0s
+  evaluations (one my_cube.clone() each): 340457
+  manhattan_distance calls: 11235096
+  misplaced_stickers calls: 11235096
+  rotate calls: 10894638
+  quarter turns: 21628667
+  harness normalisations (excluded from budget): 321603
+  harness observation cache hits: 399054
+
+5. New solver: block diversity and attributed block gains
+--------------------------------------------------------
+seed 42: 97 distinct sequences in a block population of 100; origins {'initial': 7, 'offspring': 63, 'fresh': 30}
+  reduced length histogram (length:count): 1:14 2:5 3:7 4:4 5:5 6:8 7:7 8:6 9:4 10:7 11:9 12:5 13:8 14:6 15:2 16:3
+  last completed batch #9473 (1 distinct contexts): useful blocks 0, best mean relative gain 0.0000, best max relative gain 0.0000, best absolute gain 0
+  baseline-start attempts 227352, improvements 0; targeted appends 0, exploratory appends 591895
+  attributed improvements: 0 across 0 block IDs; top: none
+  block discoveries archived: 0; fallbacks: {'empty-result': 14059}
+seed 43: 95 distinct sequences in a block population of 100; origins {'initial': 6, 'offspring': 62, 'fresh': 32}
+  reduced length histogram (length:count): 1:13 2:4 3:9 4:6 5:9 6:4 7:4 8:5 9:4 10:7 11:6 12:7 13:6 14:5 15:3 16:8
+  last completed batch #9539 (1 distinct contexts): useful blocks 0, best mean relative gain 0.0000, best max relative gain 0.0000, best absolute gain 0
+  baseline-start attempts 228936, improvements 0; targeted appends 0, exploratory appends 594710
+  attributed improvements: 0 across 0 block IDs; top: none
+  block discoveries archived: 0; fallbacks: {'empty-result': 13819}
+seed 44: 94 distinct sequences in a block population of 100; origins {'initial': 6, 'offspring': 64, 'fresh': 30}
+  reduced length histogram (length:count): 1:14 2:8 3:13 4:6 5:5 6:5 7:3 8:5 9:10 10:3 11:5 12:7 13:4 14:4 15:4 16:4
+  last completed batch #9411 (1 distinct contexts): useful blocks 0, best mean relative gain 0.0000, best max relative gain 0.0000, best absolute gain 0
+  baseline-start attempts 225864, improvements 0; targeted appends 0, exploratory appends 586844
+  attributed improvements: 0 across 0 block IDs; top: none
+  block discoveries archived: 0; fallbacks: {'empty-result': 13668}
+Block gains are measured on each generation's changing context batch, not on a fixed objective.
+
+6. Protocol and effective configuration
+---------------------------------------
+setting              both solvers
+-------------------  --------------------------------------------------------------------------------------------------------------------
+Input                active cube literal from spec section 3.1 (also the last my_cube in solver_deap.py)
+Seeds                42 43 44
+Objective            pure manhattan compatibility state cost for the comparison outcome
+Solution capacity    32 face-turn genes
+Solution population  200
+Search budget        120 s monotonic time per run, generation ceiling 1000000 so the clock binds
+Execution            same machine, serial single-process runs, each in a fresh subprocess, MPLBACKEND=Agg, PYTHONHASHSEED=0, no GUI plots
+
+New solver configuration (identical for every seed except the seed itself):
+  fitness: manhattan
+  solution_population: 200
+  block_population: 100
+  solution_capacity: 32
+  block_capacity: 16
+  contexts: 16
+  generations (ceiling): 1000000
+  min_block_gain: 1.0
+  time_limit: 120.0
+  log_every: 100
+  solution operators: {'append-block': 0.4, 'splice-block': 0.2, 'move-variation': 0.25, 'crossover': 0.15}
+  block operators: ['insert', 'delete', 'substitute', 'inverse', 'concatenate', 'span-replace', 'crossover']
+
+Old solver: solver_deap.py read from disk and compiled in memory with these AST overrides
+(seed shown for 42; each run substitutes its own seed). Source sha256 7060ad3ce72a0aa5bd0552a8441b308f188dd5b8f020077a4d7521b75b4d735d.
+  - line 10: random.seed() -> random.seed(42)
+  - line 13: POPULATION_SIZE = 5000 -> 200
+  - line 14: GENERATIONS = 5000 -> 1000000
+  - line 18: MAX_GENES = 12 -> 32
+  - lines 506-534: 20 statements after the GA run (full-chromosome final printout, print_best, matplotlib plot and plt.show) are not executed; the harness replays and reports the best verified prefix instead
+  Unchanged: MUTATION_PROB 0.9, CROSSOVER_PROB 0.001, HALL_OF_FAME_SIZE 1, selTournament(5), mutate_individual_mixed, cxOnePoint,
+    evaluate_individual_manhattan_misplaced with weight_manhattan 1.0 / weight_misplaced 0.0, verbose logbook output (sent to a log sink).
+Old solver instrumentation rules:
+  - toolbox.evaluate is wrapped: a budget check runs before each evaluation, then the original evaluator runs unchanged (including its global min_moves/best_fitness_ever updates).
+  - rotate() is wrapped: a budget check runs before every face turn, so the time limit can stop the script inside an evaluation instead of after a whole population; it also counts calls and quarter turns.
+  - manhattan_distance() and misplaced_stickers() are wrapped only to count calls.
+  - After each completed evaluation the harness replays the individual's genes from the original cube with solver_deap_coevolution's reducer and best-prefix normalisation (capacity 32), verifies the chosen prefix by independent replay and keeps it if its (unsolved, H, length) rank is strictly better. This also covers partially completed generations before the hall-of-fame update.
+  - toolbox.select is wrapped only to mark generation boundaries and to count distinct best-prefix endpoints of each fully evaluated population; it passes the arguments through unchanged.
+  - Observation never touches the global random module, the individuals or their fitness values, so selection decisions are unchanged (checked by the neutrality run below).
+  - Observation time is paused out of the baseline's search budget and reported separately, so harness overhead does not shorten the baseline's own 120 s of search.
+  - A verified feasible solve stops the run early.
+
+7. Remaining differences between the two harnesses
+-------------------------------------------------
+- The old solver keeps its own fitness: min over prefixes of manhattan + 0*misplaced + length/MAX_GENES, seeded by the module-global min_moves/best_fitness_ever, which change during the run. The new solver ranks (unsolved, H, reduced length) with a pure H. Only the replayed endpoint cost/solved status is compared.
+- The old evaluator applies all 32 genes and computes misplaced_stickers at every prefix even though its weight is 0; the new solver normalises to the best reduced prefix and caches pure H values.
+- The old GA uses the module-global random generator; the new solver uses one seeded random.Random per run. Equal seed numbers do not imply comparable random streams.
+- Old-solver harness observation (best-prefix replay) is paused out of its budget; the new solver's own normalisation and verification are part of its search and count against its budget.
+- The old solver still prints its logbook every generation and print_best every 25 generations (into a log sink); the new solver reports every 100 generations.
+
+8. Environment and integrity checks
+----------------------------------
+Machine: macOS-26.6.2-arm64-arm-64bit; CPU Apple M1 Pro (10 logical cores)
+Python: CPython 3.12.2
+Libraries: deap 1.4.4, numpy 2.5.4, matplotlib 3.11.2, colorama 0.4.6
+Git commit: 93c8b9e
+cube.py: sha256 7262daa8c3e175539de0e1baff462e7a8929e6af6bb81f3e8df58b3f856cc7c2 before, unchanged after
+solver_deap.py: sha256 7060ad3ce72a0aa5bd0552a8441b308f188dd5b8f020077a4d7521b75b4d735d before, unchanged after
+git diff HEAD on cube.py, solver_deap.py: clean
+Observation neutrality: seed 42, 5 generations with and without best-prefix observation -> final populations identical (sha256 eb13cb111e36318816b1309b40e8083c2f7d010f20745fd501a2ac5c5d854b36)
