@@ -248,7 +248,7 @@ class ObjectiveTests(unittest.TestCase):
         self.assertEqual(s.manhattan_cost(CHECKPOINT_KEY), self.reference_manhattan(CHECKPOINT_KEY))
 
     def test_every_objective_identifies_the_solved_state(self):
-        objectives = [s.make_objective(name) for name in ("manhattan", "misplaced", "manhattan-min", "cubie")]
+        objectives = [s.make_objective(name) for name in ("manhattan", "misplaced", "manhattan-min", "cubie", "edges")]
         objectives.append(s.make_objective("manhattan-misplaced", 0.5, 2.0))
         objectives.append(s.make_objective("manhattan-misplaced", 0.0, 1.0))
         rng = random.Random(4)
@@ -292,24 +292,28 @@ class ObjectiveTests(unittest.TestCase):
             self.assertEqual(s.make_objective("cubie").cost(key), cost)
 
     def test_edge_cost_properties(self):
-        self.assertEqual(s.EDGE_STICKER_POSITIONS, tuple(sorted(f * 9 + i for f in range(6) for i in (1, 3, 5, 7))))
+        # The 20 blocks around the centres cover every non-centre sticker exactly once.
+        self.assertEqual(sorted(position for slot in s._CUBIE_SLOTS for position in slot),
+                         [position for position in range(54) if position % 9 != 4])
+        self.assertEqual(Counter(len(slot) for slot in s._CUBIE_SLOTS), {3: 8, 2: 12})
         self.assertEqual(s.edge_cost(SOLVED_KEY), 0)
-        for allele in s.REAL_MOVES:  # a turn moves 4 edges; each puts one sticker on a foreign face
-            self.assertEqual(s.edge_cost(key_after(SOLVED_KEY, (allele,))), 4)
+        for allele in s.REAL_MOVES:  # a turn moves 4 corners and 4 edges off their home colours
+            self.assertEqual(s.edge_cost(key_after(SOLVED_KEY, (allele,))), 8)
         rng = random.Random(7)
         for _ in range(200):
             key = key_after(SOLVED_KEY, s.generate_reduced_block(rng.randint(1, 20), rng))
-            expected = sum(key[f * 9 + i] != key[f * 9 + 4] for f in range(6) for i in (1, 3, 5, 7))
+            expected = sum(any(key[p] != key[(p // 9) * 9 + 4] for p in slot) for slot in s._CUBIE_SLOTS)
             self.assertEqual(s.edge_cost(key), expected)
             self.assertLessEqual(s.edge_cost(key), s.misplaced_cost(key))
+            self.assertGreaterEqual(3 * s.edge_cost(key), s.misplaced_cost(key))
             self.assertEqual(s.make_objective("edges").cost(key), expected)
-        # Corners are not scored: twisting one corner's stickers leaves the edge cost at 0, but not solved.
+        # Corners count: twisting one corner in place makes exactly one block wrong.
         stickers = list(SOLVED_KEY)
         corner = next(slot for slot in s._CUBIE_SLOTS if len(slot) == 3)
         for position, colour in zip(corner, [stickers[p] for p in corner[1:] + corner[:1]]):
             stickers[position] = colour
         twisted = "".join(stickers)
-        self.assertEqual(s.edge_cost(twisted), 0)
+        self.assertEqual(s.edge_cost(twisted), 1)
         self.assertFalse(s.is_solved_key(twisted))
 
     def test_cubie_fitness_rejects_inconsistent_cubies(self):

@@ -173,9 +173,9 @@ function), `misplaced`, the weighted `manhattan-misplaced`, `cubie`, or
 `edges`. `cubie` is the sum over the 20 corner and edge cubies of the moves
 each would need on its own to reach its home slot and orientation; it rejects
 an input whose stickers do not form a consistent set of cubies. `edges` counts
-only the 24 edge stickers (the middle of each face's border) that differ from
-their face centre, so corners are not scored and it cannot steer a full solve
-on its own. Solved means every sticker matches its
+the 20 blocks around the centres (8 corners and 12 edges) that do not show all
+their correct colours, so it scores whole blocks instead of single stickers on
+each side. Solved means every sticker matches its
 face centre, whatever `H` is in use, and every reported result is replayed
 from the original cube before it counts.
 

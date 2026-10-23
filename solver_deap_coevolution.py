@@ -19,8 +19,8 @@ Conventions used throughout this module:
   on solution length.
 * The "cubie" objective sums, over the 20 corner and edge cubies, the moves each
   would need on its own to reach its home slot and orientation.
-* The "edges" objective counts the 24 edge stickers that differ from their own
-  face centre. Corners are not scored, so it cannot steer a full solve alone.
+* The "edges" objective counts the 20 blocks around the centres (8 corners and
+  12 edges) that do not show all their correct colours.
 * Solved detection is independent of the objective: every sticker must equal
   its own face centre.
 
@@ -478,17 +478,19 @@ def validate_cubie_input(key):
         raise InvalidInputError("the stickers repeat a cubie, so they are not a consistent set of cubies")
 
 
-# The 24 edge stickers (two on each of the 12 edge cubies), each paired with its face centre.
-EDGE_STICKER_POSITIONS = tuple(sorted(position for slot in _CUBIE_SLOTS if len(slot) == 2 for position in slot))
-_EDGE_STICKER_CENTRES = tuple((position, (position // 9) * 9 + 4) for position in EDGE_STICKER_POSITIONS)
+# The 20 blocks around the centres (8 corners, 12 edges): each block's stickers paired with their face centres.
+_BLOCK_STICKER_CENTRES = tuple(tuple((position, (position // 9) * 9 + 4) for position in slot)
+                               for slot in _CUBIE_SLOTS)
 
 
 def edge_cost(key):
-    """Edge stickers whose colour differs from their own face centre (0-24); corners are not scored."""
+    """Blocks around the centres (8 corners, 12 edges) not showing all their correct colours (0-20)."""
     total = 0
-    for position, centre in _EDGE_STICKER_CENTRES:
-        if key[position] != key[centre]:
-            total += 1
+    for block in _BLOCK_STICKER_CENTRES:
+        for position, centre in block:
+            if key[position] != key[centre]:
+                total += 1
+                break
     return total
 
 
@@ -530,7 +532,8 @@ class Objective:
         if self.state_function == "cubie":
             return f"{self.name}: sum over the 20 cubies of each one's move distance to its home slot and orientation"
         if self.state_function == "edges":
-            return f"{self.name}: edge stickers (24) that differ from their face centre; corners are not scored"
+            return (f"{self.name}: blocks around the centres (8 corners, 12 edges) "
+                    "not showing all their correct colours")
         alias =" (compatibility alias of manhattan)" if self.name == "manhattan-min" else ""
         return (f"{self.name}{alias}: colour/face-offset mismatch heuristic "
                 "(not a geometric distance, not a lower bound)")
