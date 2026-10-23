@@ -1038,6 +1038,7 @@ class CoevolutionRun:
         self._block_cache = {}
         self._block_index = {}
         self._block_representatives = []
+        self._context_sources = {}
         self._block_info = {}
         self.batch = None
         self.population = None
@@ -1330,37 +1331,76 @@ class CoevolutionRun:
                     index.setdefault(context.key, []).append((block.active, block.uid, outcome.qualifying))
         self._block_representatives = ordered
         self._block_index = index
+        self._context_sources = {context.key: context.source for context in batch.contexts}
 
     def _exploratory_block(self):
         block = self._block_representatives[self.rng.randrange(len(self._block_representatives))]
         return block.active, block.uid
 
+    def _score_append_entry(self, entry, base_reducer):
+        """Best ``(preference, k)`` of one indexed block for a parent, or None if no prefix fits.
+
+        ``base_reducer`` None means the parent is the context's own source sequence,
+        so the stored representative lengths and feasibility are exact for it.
+        """
+        sequence, _, qualifying = entry
+        best = None
+        if base_reducer is None:
+            for outcome in qualifying:
+                if not outcome.representative_feasible:
+                    continue
+                preference = _prefix_preference(outcome.solved, outcome.gain, outcome.representative_length,
+                                                outcome.k)
+                if best is None or preference < best[0]:
+                    best = (preference, outcome.k)
+            return best
+        reducer = base_reducer.copy()
+        pushed = 0
+        for outcome in qualifying:
+            while pushed < outcome.k:
+                reducer.push(sequence[pushed])
+                pushed += 1
+            # Feasibility is rechecked against this actual parent, not the representative.
+            if reducer.length > self.solution_capacity:
+                continue
+            preference = _prefix_preference(outcome.solved, outcome.gain, reducer.length, outcome.k)
+            if best is None or preference < best[0]:
+                best = (preference, outcome.k)
+        return best
+
     def choose_append_payload(self, parent_active, parent_endpoint):
-        """Block prefix to append to a parent (section 7.4); returns (payload, block_id, targeted)."""
+        """Block prefix to append to a parent (section 7.4); returns (payload, block_id, targeted).
+
+        Tournament entrants are drawn uniformly from the blocks with evidence for this
+        endpoint and only those are scored. A drawn block with no prefix that fits the
+        parent is rejected and redrawn, which gives the same tournament as scoring every
+        block first. Each block is scored at most once per call; once every block has
+        been rejected the append falls back to an exploratory block.
+        """
         entries = self._block_index.get(parent_endpoint, ())
-        options = []
         if entries:
-            base_reducer = MoveReducer.from_moves(parent_active)
-            for sequence, uid, qualifying in entries:
-                reducer = base_reducer.copy()
-                pushed = 0
-                best = None
-                for outcome in qualifying:
-                    while pushed < outcome.k:
-                        reducer.push(sequence[pushed])
-                        pushed += 1
-                    # Feasibility is rechecked against this actual parent, not the representative.
-                    if reducer.length > self.solution_capacity:
-                        continue
-                    preference = _prefix_preference(outcome.solved, outcome.gain, reducer.length, outcome.k)
-                    if best is None or preference < best[0]:
-                        best = (preference, outcome.k)
-                if best is not None:
-                    options.append((best[0], sequence, uid, best[1]))
-        if options:
-            _, sequence, uid, k = tournament_select(options, lambda option: option[0], self.rng)
-            self.counters.targeted_appends += 1
-            return tuple(sequence[:k]), uid, True
+            if tuple(parent_active) == self._context_sources.get(parent_endpoint):
+                base_reducer = None
+            else:
+                base_reducer = MoveReducer.from_moves(parent_active)
+            scores = {}
+            draws = []
+            rejected = 0
+            while len(draws) < TOURNAMENT_SIZE and rejected < len(entries):
+                index = self.rng.randrange(len(entries))
+                if index not in scores:
+                    scores[index] = self._score_append_entry(entries[index], base_reducer)
+                    if scores[index] is None:
+                        rejected += 1
+                if scores[index] is not None:
+                    draws.append((scores[index][0], index))
+            if draws:
+                best = min(preference for preference, _ in draws)
+                tied = [index for preference, index in draws if preference == best]
+                index = tied[0] if len(tied) == 1 else tied[self.rng.randrange(len(tied))]
+                sequence, uid, _ = entries[index]
+                self.counters.targeted_appends += 1
+                return tuple(sequence[:scores[index][1]]), uid, True
         sequence, uid = self._exploratory_block()
         self.counters.exploratory_appends += 1
         return sequence, uid, False

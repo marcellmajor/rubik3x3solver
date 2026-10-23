@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from collections import Counter
 from types import SimpleNamespace
+from unittest import mock
 
 import solver_deap_coevolution as s
 
@@ -586,6 +587,65 @@ class BlockTests(unittest.TestCase):
         payload, _, targeted = run.choose_append_payload(long_parent, original)
         self.assertFalse(targeted)
         self.assertEqual(payload, s.parse_moves("C3 U3"))
+
+    def test_append_scores_each_block_once_then_falls_back(self):
+        original = key_after(SOLVED_KEY, "R1 U1 C1")
+        long_parent = s.parse_moves("R2 U2 " * 6)  # ends in U2, so only U-first blocks could merge and fit
+        run = make_run(s.cube_from_key(original), solution_population=5, contexts=1,
+                       solution_capacity=12, block_capacity=4)
+        records = [run.make_block(s.parse_moves(text), origin="fixture")
+                   for text in ("C3 U3", "C3", "D1 C3", "C3 B1", "B1 L2")]
+        self.evaluate(run, population_with(run, [], 5), records)
+        entries = run._block_index[original]
+        self.assertGreater(len(entries), 1)
+        self.assertFalse(any(s.MOVE_NAMES[sequence[0]][0] == "U" for sequence, _, _ in entries))
+        scored = Counter()
+        score = run._score_append_entry
+
+        def counting(entry, base_reducer):
+            scored[entry[1]] += 1
+            return score(entry, base_reducer)
+
+        run._score_append_entry = counting
+        _, block_id, targeted = run.choose_append_payload(long_parent, original)
+        self.assertFalse(targeted)
+        self.assertEqual(set(scored), {uid for _, uid, _ in entries})
+        self.assertEqual(set(scored.values()), {1})
+        self.assertIn(block_id, {block.uid for block in records})
+
+    def test_append_shortcut_for_context_source_parents_is_exact(self):
+        original = key_after(SOLVED_KEY, "R1 U1 C1")
+        run = make_run(s.cube_from_key(original), solution_population=5, contexts=2)
+        records = [run.make_block(s.parse_moves(text), origin="fixture")
+                   for text in ("C3 U3", "U3", "D3", "D1 C3", "B1 L2")]
+        batch = self.evaluate(run, population_with(run, ["R3"], 5), records)
+        self.assertEqual([context.source for context in batch.contexts], [(), s.parse_moves("R3")])
+        for context in batch.contexts:
+            entries = run._block_index[context.key]
+            self.assertTrue(entries)
+            replayed = s.MoveReducer.from_moves(context.source)
+            for entry in entries:
+                self.assertEqual(run._score_append_entry(entry, None), run._score_append_entry(entry, replayed))
+        with mock.patch.object(s.MoveReducer, "from_moves", side_effect=AssertionError("reducer replayed")):
+            for context in batch.contexts:
+                self.assertTrue(run.choose_append_payload(context.source, context.key)[2])
+
+    def test_sampled_append_matches_the_full_tournament(self):
+        original = key_after(SOLVED_KEY, "R1 U1 C1")
+        run = make_run(s.cube_from_key(original), solution_population=5, block_population=30, contexts=1)
+        blocks = run.initial_block_population()
+        self.evaluate(run, population_with(run, [], 5), blocks)
+        empty = s.MoveReducer()
+        options = [(run._score_append_entry(entry, empty), entry) for entry in run._block_index[original]]
+        self.assertGreater(len(options), 5)
+        self.assertTrue(all(score is not None for score, _ in options))
+        for seed in range(100):
+            run.rng = random.Random(seed)
+            payload, uid, targeted = run.choose_append_payload((), original)
+            (_, k), (sequence, expected_uid, _) = s.tournament_select(options, lambda option: option[0][0],
+                                                                    random.Random(seed))
+            self.assertTrue(targeted)
+            self.assertEqual((payload, uid), (sequence[:k], expected_uid))
 
     def test_fresh_blocks_follow_the_reduced_length_schedule(self):
         run = make_run(block_population=20, block_capacity=4, solution_capacity=8)
