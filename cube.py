@@ -325,6 +325,16 @@ class Cube(object):
         print(color_selector[self.bottom_face[8]] + ' ' * 2,end='')
         print(colorama.Style.RESET_ALL)
 
+    def print_as_python_list(self):
+        print('[')
+        print('                              "' + self.top_face + '",')
+        print('[', end='')
+        for _face in self.row_of_faces:
+            print(' "' + _face + '", ', end='')
+        print('],')
+        print('                              "' + self.bottom_face + '"')
+        print(']')
+
     def test_cube(self):
         _colorcount = defaultdict(int)
         assert(len(self.top_face) == blocks_per_face)
