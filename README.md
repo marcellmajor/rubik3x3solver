@@ -1,10 +1,11 @@
 # Rubik's 3×3 Solver
 
-Experimental Python solvers for a scrambled 3×3 Rubik's cube. Two search
-front-ends — a hand-rolled solver and a [DEAP](https://deap.readthedocs.io/)
-genetic algorithm — share one cube model, one move encoding, and heuristic
-scoring. This is research code, not a general-purpose solver: inputs are
-hardcoded, there is no CLI, and no search guarantees an optimal (or any)
+Experimental Python solvers for a scrambled 3×3 Rubik's cube. Three search
+front-ends — a hand-rolled solver, a [DEAP](https://deap.readthedocs.io/)
+genetic algorithm, and a DEAP cooperative coevolution of solutions and move
+blocks — share one cube model, one move encoding, and heuristic scoring. This
+is research code, not a general-purpose solver: inputs are hardcoded, only the
+coevolution solver has a CLI, and no search guarantees an optimal (or any)
 solution.
 
 ## Layout
@@ -15,6 +16,10 @@ solution.
 | [solution.py](solution.py) | `Solution`: move-sequence ("chromosome") handling and fitness evaluation used by [solver.py](solver.py). |
 | [solver.py](solver.py) | Hand-rolled solver: exhaustive combination search (single/multi-threaded, multiprocess, meet-in-the-middle), then a mutation/crossover hill-climb. |
 | [solver_deap.py](solver_deap.py) | DEAP genetic algorithm with elitism, algorithm-aware mutation, and a fitness plot. Current, most-tuned entry point. |
+| [solver_deap_coevolution.py](solver_deap_coevolution.py) | DEAP cooperative coevolution: solution candidates plus evolving move blocks, with a CLI. |
+| [test_solver_deap_coevolution.py](test_solver_deap_coevolution.py) | Deterministic `unittest` suite for the coevolution solver. |
+| [benchmark_coevolution.py](benchmark_coevolution.py), [experiment_coevolution.txt](experiment_coevolution.txt) | Bounded comparison of the two DEAP solvers, and its recorded report. |
+| [pyproject.toml](pyproject.toml), [uv.lock](uv.lock) | Project metadata, dependencies, and the lockfile used by [uv](https://docs.astral.sh/uv/). |
 
 ## Cube model ([cube.py](cube.py))
 
@@ -108,7 +113,10 @@ The active fitness, `evaluate_individual_manhattan_misplaced`, clones the
 target cube, applies the moves, and scores **every prefix**: it keeps the
 best value of `manhattan + (moves used / MAX_GENES)` (misplaced-sticker
 weight is currently `0`), so shorter prefixes win ties. `manhattan_distance`
-measures each sticker's grid distance to its goal block on the unfolded net.
+is a colour-mismatch heuristic, not a true move distance: for each sticker it
+adds the grid distance between its own colour's block and its face centre
+colour's block on the unfolded net (the sticker's position within the face
+cancels out).
 Side effects track the global best-ever prefix length (`min_moves`), which
 `print_best()` uses to show the effective solution. Simpler alternatives
 (misplaced-sticker count, final Manhattan distance) remain registered-out.
@@ -135,16 +143,77 @@ earlier runs (see the commented "Best individual moves" blocks), so the
 script currently continues from the last checkpoint rather than from the
 original scramble.
 
+## Cooperative coevolution solver ([solver_deap_coevolution.py](solver_deap_coevolution.py))
+
+A separate DEAP entry point that evolves two populations together:
+
+- **Solution candidates** are move sequences applied to the input cube. Each
+  candidate is normalised to its best prefix and stored as exactly that
+  reduced sequence, padded with `NOOP`, so the stored moves are the ones that
+  produced its score. Candidates rank by `(unsolved, H(endpoint), length)`,
+  all minimised.
+- **Move blocks** are reusable combinations of up to 16 moves, scored on a
+  shared batch of up to 16 solution endpoints ("contexts": the original cube,
+  the best elite states, and a random sample of other states). A block is
+  useful on a context when some prefix lowers `H` by at least
+  `--min-block-gain`, so a block may pass through worse states first.
+
+Each generation keeps the best 20 % of solutions unchanged, replaces the
+worst 20 % with empty candidates, and breeds the middle 60 % by appending
+or splicing blocks, varying single moves, or crossover. A fixed share of those
+offspring always restarts from the empty candidate. The block population keeps
+10 % elites, breeds 60 % with seven operators, and draws 30 % fresh blocks,
+with a cap on duplicate sequences.
+
+Moves use the same `R L U D C B` letters with counts `1..3`, plus `NOOP`. A
+shared simplifier merges same-face turns and commutes opposite faces (`R`/`L`,
+`U`/`D`, `C`/`B`), so reported lengths are reduced, not globally minimal.
+`--fitness` picks `H`: `manhattan` (default, the heuristic above as a pure
+function), `misplaced`, or the weighted `manhattan-misplaced`. Solved means
+every sticker matches its face centre, whatever `H` is in use, and every
+reported result is replayed from the original cube before it counts.
+
+Unlike the older scripts it has a `main()` guard and no import side effects.
+The input is still hardcoded: `default_input_cube()` is the active checkpoint
+from `solver_deap.py`. Other cubes can go through the library call
+`run_search(SearchConfig(...), cube)`. Main options: `--seed`,
+`--time-limit`, `--generations`, the population, capacity and context sizes,
+and `--plot` (saves `coevolution_progress.png` without opening a window).
+Exit codes: `0` verified solve, `1` budget exhausted, `2` invalid input, `3`
+internal or replay error, `130` interrupted.
+
+## Benchmark ([benchmark_coevolution.py](benchmark_coevolution.py))
+
+Runs both DEAP solvers on the active checkpoint for seeds 42, 43 and 44, with
+120 s, solution capacity 32 and population 200 per run, serially in fresh
+subprocesses. `solver_deap.py` is read from disk and changed in memory only
+(seed, `MAX_GENES`, `POPULATION_SIZE`, generation ceiling, no final plot),
+plus read-only hooks that enforce the time limit and record its best prefix.
+The report goes to `experiment_coevolution.txt`, numbered if that file exists.
+
+In the recorded run ([experiment_coevolution.txt](experiment_coevolution.txt))
+neither solver solved or improved the active checkpoint: `H` stayed at 24.
+The coevolution solver ran about 9,500 generations per run to the GA's
+1,900, but no block of up to 16 moves lowered this near-solved cube's cost.
+Three seeds describe behaviour on one cube; they are not a solve rate.
+
 ## Running
 
-Requires Python 3 and, for the DEAP solver, third-party packages (there is
-no `requirements.txt`):
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then
+run the solvers from this directory. `uv run` creates `.venv` on first use,
+installs the locked dependencies (`colorama`, `deap`, `numpy`, `matplotlib`),
+and uses the Python in [`.python-version`](.python-version) (3.12), downloading
+that interpreter if it is not already installed.
 
 ```bash
-pip install colorama deap numpy matplotlib
-python solver_deap.py   # DEAP genetic algorithm
-python solver.py        # needs combinations*.txt, see above
+uv run python solver_deap.py   # DEAP genetic algorithm
+uv run python solver.py        # needs combinations*.txt, see above
+uv run python solver_deap_coevolution.py --seed 42   # coevolution; --help lists options
+uv run python -m unittest test_solver_deap_coevolution -v
+uv run python benchmark_coevolution.py   # ~15 minutes
 ```
+
+`uv sync` only installs the environment, without starting a solver.
 
 To solve a different scramble, replace the active `Cube(...)` literal in the
 script you run, keeping exactly nine stickers of each colour —
@@ -152,7 +221,12 @@ script you run, keeping exactly nine stickers of each colour —
 
 ## Limitations
 
-- Hardcoded inputs and parameters; no arguments, tests, or packaging.
+- `solver.py` and `solver_deap.py` use hardcoded inputs and parameters, with
+  no arguments or tests. The coevolution solver has a CLI and tests but still
+  starts from the hardcoded checkpoint. Dependencies are installed with uv.
+- The coevolution solver solves short scrambles (up to about 6 moves in
+  testing) but did not get past the active checkpoint's plateau in the
+  benchmark.
 - Fitness is a heuristic, not an admissible bound: search can stall at local
   optima and solutions are neither guaranteed nor minimal.
 - Exhaustive modes materialise every combination in memory/on disk and do
