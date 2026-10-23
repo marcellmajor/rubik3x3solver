@@ -17,6 +17,8 @@ Conventions used throughout this module:
 * The "manhattan" objective is the repository's historical colour/face-offset
   mismatch heuristic. It is not a geometric cube distance and not a lower bound
   on solution length.
+* The "cubie" objective sums, over the 20 corner and edge cubies, the moves each
+  would need on its own to reach its home slot and orientation.
 * Solved detection is independent of the objective: every sticker must equal
   its own face centre.
 
@@ -37,7 +39,7 @@ import random
 import signal
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from operator import itemgetter
 from typing import Optional
@@ -62,8 +64,8 @@ DEFAULT_LOG_EVERY = 10
 DEFAULT_MANHATTAN_WEIGHT = 1.0
 DEFAULT_MISPLACED_WEIGHT = 1.0
 
-FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min")
-INTEGER_VALUED_FITNESS = ("manhattan", "manhattan-min", "misplaced")
+FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie")
+INTEGER_VALUED_FITNESS = ("manhattan", "manhattan-min", "misplaced", "cubie")
 
 # Ordinary solution-offspring operators and their probabilities (section 7.5).
 SOLUTION_OPERATOR_PROBABILITIES = (
@@ -390,6 +392,85 @@ def manhattan_cost(key):
     return total
 
 
+def _build_cubie_tables():
+    """Per-slot lookup from the face indices on a slot's stickers to that cubie's distance home.
+
+    Cubie slots are the groups of sticker positions moved by exactly the same
+    turns (8 corners, 12 edges). Each cubie's distance is a breadth-first search
+    over the 18 moves of where its stickers can be, so it covers orientation.
+    """
+    positions = tuple(range(STICKER_COUNT))
+    destination = {}
+    for allele in REAL_MOVES:
+        target = [0] * STICKER_COUNT
+        for new_position, old_position in enumerate(_MOVE_TABLES[allele](positions)):
+            target[old_position] = new_position
+        destination[allele] = target
+    groups = defaultdict(list)
+    for position in positions:
+        moved_by = frozenset(allele for allele in REAL_MOVES if destination[allele][position] != position)
+        if moved_by:
+            groups[moved_by].append(position)
+    slots = [tuple(group) for group in groups.values()]
+    if sorted(len(slot) for slot in slots) != [2] * 12 + [3] * 8:
+        raise ConsistencyError("move tables do not split into 8 corners and 12 edges")
+    slot_index = {frozenset(slot): index for index, slot in enumerate(slots)}
+    tables = [{} for _ in slots]
+    for home in slots:
+        labels = [str(position // 9) for position in home]
+        distance = {home: 0}
+        queue = deque([home])
+        while queue:
+            placement = queue.popleft()
+            for allele in REAL_MOVES:
+                moved = tuple(destination[allele][position] for position in placement)
+                if moved not in distance:
+                    distance[moved] = distance[placement] + 1
+                    queue.append(moved)
+        for placement, steps in distance.items():
+            index = slot_index[frozenset(placement)]
+            label_at = dict(zip(placement, labels))
+            tables[index]["".join(label_at[position] for position in slots[index])] = steps
+    return tuple((itemgetter(*slot), table) for slot, table in zip(slots, tables))
+
+
+_CUBIE_TABLES = _build_cubie_tables()
+_FACE_INDEX_TRANSLATIONS = {}
+
+
+def _face_indices(key):
+    """The key with every sticker replaced by the index (0-5) of the face whose centre it matches."""
+    centres = key[4] + key[13] + key[22] + key[31] + key[40] + key[49]
+    translation = _FACE_INDEX_TRANSLATIONS.get(centres)
+    if translation is None:
+        translation = _FACE_INDEX_TRANSLATIONS[centres] = str.maketrans(centres, "012345")
+    return key.translate(translation)
+
+
+def cubie_cost(key):
+    """Sum over the 20 cubies of the moves each would need, on its own, to reach its home slot and orientation."""
+    faces = _face_indices(key)
+    total = 0
+    try:
+        for getter, distances in _CUBIE_TABLES:
+            total += distances["".join(getter(faces))]
+    except KeyError:
+        raise ValueError("the stickers do not form a consistent set of cubies") from None
+    return total
+
+
+def validate_cubie_input(key):
+    """Require every corner and edge slot to hold a distinct real cubie (needed by the cubie objective)."""
+    try:
+        cubie_cost(key)
+    except ValueError as exc:
+        raise InvalidInputError(str(exc)) from None
+    faces = _face_indices(key)
+    cubies = {"".join(sorted(getter(faces))) for getter, _ in _CUBIE_TABLES}
+    if len(cubies) != len(_CUBIE_TABLES):
+        raise InvalidInputError("the stickers repeat a cubie, so they are not a consistent set of cubies")
+
+
 @dataclass(frozen=True)
 class Objective:
     name: str
@@ -410,6 +491,8 @@ class Objective:
             return manhattan_cost(key)
         if self.state_function == "misplaced":
             return misplaced_cost(key)
+        if self.state_function == "cubie":
+            return cubie_cost(key)
         value = self.manhattan_weight * manhattan_cost(key) + self.misplaced_weight * misplaced_cost(key)
         if not math.isfinite(value):
             raise NumericalError(f"non-finite state cost {value!r}")
@@ -421,7 +504,9 @@ class Objective:
                     f"{self.misplaced_weight!r} * misplaced")
         if self.state_function == "misplaced":
             return f"{self.name}: stickers differing from their face centre"
-        alias = " (compatibility alias of manhattan)" if self.name == "manhattan-min" else ""
+        if self.state_function == "cubie":
+            return f"{self.name}: sum over the 20 cubies of each one's move distance to its home slot and orientation"
+        alias =" (compatibility alias of manhattan)" if self.name == "manhattan-min" else ""
         return (f"{self.name}{alias}: colour/face-offset mismatch heuristic "
                 "(not a geometric distance, not a lower bound)")
 
@@ -434,7 +519,7 @@ def make_objective(name, manhattan_weight=None, misplaced_weight=None):
         if manhattan_weight is not None or misplaced_weight is not None:
             raise ConfigError("--manhattan-weight/--misplaced-weight are valid only with "
                               "--fitness manhattan-misplaced")
-        return Objective(name, "misplaced" if name == "misplaced" else "manhattan")
+        return Objective(name, name if name in ("misplaced", "cubie") else "manhattan")
     weights = []
     for label, value, default in (
         ("manhattan", manhattan_weight, DEFAULT_MANHATTAN_WEIGHT),
@@ -1097,6 +1182,8 @@ class CoevolutionRun:
         self.history = tools.Logbook()
 
         self._last_report_marker = None
+        if objective.state_function == "cubie":
+            validate_cubie_input(input_key)
         baseline = self.normalize_solution((), check_budget=False)
         self.baseline = baseline
         self.baseline_rank = baseline.rank
@@ -2063,6 +2150,8 @@ def main(argv=None, *, clock=None):
         objective = validate_config(config)
         input_cube = default_input_cube()
         input_key = validate_input_cube(input_cube)
+        if objective.state_function == "cubie":
+            validate_cubie_input(input_key)
     except (ConfigError, InvalidInputError) as exc:
         _print_status(STATUS_INVALID_INPUT, f"Invalid configuration or input: {exc}")
         return EXIT_CODES[STATUS_INVALID_INPUT]

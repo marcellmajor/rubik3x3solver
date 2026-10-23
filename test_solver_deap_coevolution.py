@@ -245,7 +245,7 @@ class ObjectiveTests(unittest.TestCase):
         self.assertEqual(s.manhattan_cost(s.validate_input_cube(s.default_input_cube())), 24)
 
     def test_every_objective_identifies_the_solved_state(self):
-        objectives = [s.make_objective(name) for name in ("manhattan", "misplaced", "manhattan-min")]
+        objectives = [s.make_objective(name) for name in ("manhattan", "misplaced", "manhattan-min", "cubie")]
         objectives.append(s.make_objective("manhattan-misplaced", 0.5, 2.0))
         objectives.append(s.make_objective("manhattan-misplaced", 0.0, 1.0))
         rng = random.Random(4)
@@ -261,9 +261,39 @@ class ObjectiveTests(unittest.TestCase):
         self.assertEqual(s.validate_config(s.config_from_args(args)).state_function, "manhattan")
         self.assertEqual(s.make_objective("manhattan-min").state_function, "manhattan")
         self.assertEqual(s.make_objective("misplaced").state_function, "misplaced")
+        cubie = s.make_objective("cubie")
+        self.assertEqual((cubie.state_function, cubie.integer_valued), ("cubie", True))
+        args = s.build_arg_parser().parse_args(["--fitness", "cubie"])
+        self.assertEqual(s.validate_config(s.config_from_args(args)).state_function, "cubie")
         mixed = s.make_objective("manhattan-misplaced")
         self.assertEqual((mixed.manhattan_weight, mixed.misplaced_weight), (1.0, 1.0))
         self.assertFalse(mixed.integer_valued)
+
+    def test_cubie_cost_properties(self):
+        self.assertEqual(s.cubie_cost(SOLVED_KEY), 0)
+        for allele in s.REAL_MOVES:  # every face turn moves 8 cubies one move from home
+            self.assertEqual(s.cubie_cost(key_after(SOLVED_KEY, (allele,))), 8)
+        recolour = str.maketrans("GRWOYB", "BYOWRG")
+        rng = random.Random(6)
+        for _ in range(200):
+            sequence = s.generate_reduced_block(rng.randint(1, 20), rng)
+            key = key_after(SOLVED_KEY, sequence)
+            cost = s.cubie_cost(key)
+            self.assertLessEqual(cost, 8 * len(sequence))
+            self.assertEqual(cost == 0, s.is_solved_key(key))
+            self.assertEqual(s.cubie_cost(key.translate(recolour)), cost)  # depends on centres, not colour names
+            self.assertEqual(s.make_objective("cubie").cost(key), cost)
+
+    def test_cubie_fitness_rejects_inconsistent_cubies(self):
+        stickers = list(SOLVED_KEY)
+        stickers[0], stickers[10] = stickers[10], stickers[0]  # a corner sticker trades places with an edge sticker
+        cube = s.cube_from_key("".join(stickers))
+        s.validate_input_cube(cube)  # colour counts and centres still pass the general check
+        with self.assertRaises(s.InvalidInputError):
+            s.run_search(s.SearchConfig(fitness="cubie", seed=1, generations=0), cube, log=lambda message: None)
+        result = s.run_search(s.SearchConfig(seed=1, generations=0), cube, log=lambda message: None)
+        self.assertEqual(result.status, s.STATUS_BUDGET_EXHAUSTED)
+        s.validate_cubie_input(s.validate_input_cube(scrambled("R1 U2 C3 D1")))
 
     def test_invalid_weights_rejected(self):
         for weights in ((0.0, 0.0), (-1.0, 1.0), (float("nan"), 1.0), (float("inf"), 1.0), (1e308, 1e308)):
@@ -290,6 +320,8 @@ class ObjectiveTests(unittest.TestCase):
         code, output = quiet(s.main, ["--fitness", "manhattan", "--misplaced-weight", "1"])
         self.assertEqual(code, 2)
         self.assertIn("Status: INVALID_INPUT", output)
+        code, _ = quiet(s.main, ["--fitness", "cubie", "--manhattan-weight", "1"])
+        self.assertEqual(code, 2)
         code, _ = quiet(s.main, ["--fitness", "manhattan-misplaced", "--manhattan-weight", "nan"])
         self.assertEqual(code, 2)
 
@@ -802,6 +834,14 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual([record["gen"] for record in result.history], [0, 1, 2, 3, 4, 5])
         self.assertGreater(result.counters.block_sequence_evaluations, 0)
         self.assertEqual(result.counters.baseline_start_attempts, 5)
+
+    def test_cubie_fitness_solves_short_scrambles(self):
+        for moves in ("R1", "R1 U1"):
+            with self.subTest(moves=moves):
+                result = s.run_search(s.SearchConfig(fitness="cubie", seed=2, generations=30, solution_population=20,
+                                                     block_population=20), scrambled(moves), log=lambda message: None)
+                self.assertEqual(s.finalize_result(result).status, s.STATUS_SOLVED)
+                self.assertTrue(s.is_solved_key(key_after(result.input_key, result.archive.active)))
 
     def test_short_scrambles_are_solved_and_replay_verified(self):
         for moves in ("R1", "C2", "R1 U1", "B3 D2"):
