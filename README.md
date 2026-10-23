@@ -169,15 +169,33 @@ Moves use the same `R L U D C B` letters with counts `1..3`, plus `NOOP`. A
 shared simplifier merges same-face turns and commutes opposite faces (`R`/`L`,
 `U`/`D`, `C`/`B`), so reported lengths are reduced, not globally minimal.
 `--fitness` picks `H`: `manhattan` (default, the heuristic above as a pure
-function), `misplaced`, the weighted `manhattan-misplaced`, `cubie`, or
-`edges`. `cubie` is the sum over the 20 corner and edge cubies of the moves
-each would need on its own to reach its home slot and orientation; it rejects
-an input whose stickers do not form a consistent set of cubies. `edges` counts
-the 20 blocks around the centres (8 corners and 12 edges) that do not show all
-their correct colours, so it scores whole blocks instead of single stickers on
-each side. Solved means every sticker matches its
+function), `misplaced`, the weighted `manhattan-misplaced`, `cubie`,
+`cubie-refined`, `grouped-cubie`, or `edges`. `cubie` is the sum over the 20 corner and edge
+cubies of the moves each would need on its own to reach its home slot and
+orientation; it and `cubie-refined` reject an input whose stickers do not
+form a consistent set of cubies (as does `grouped-cubie`). `cubie-refined` is `64 * cubie + misplaced`:
+the cubie cost stays strictly primary (misplaced counts only non-centre
+stickers, so it is at most 48 and can never outweigh one cubie unit), and
+the sticker count breaks the large ties between states with equal cubie
+cost, where selection otherwise has no gradient except length. `edges`
+counts the 20 blocks around the centres (8 corners and 12 edges) that do not
+show all their correct colours, so it scores whole blocks instead of single
+stickers on each side. Solved means every sticker matches its
 face centre, whatever `H` is in use, and every reported result is replayed
 from the original cube before it counts.
+
+`grouped-cubie` scores `4096 * P + 64 * cubie + misplaced`, where `P` is
+the sum of exact move distances for two groups of four corners and three
+groups of four edges, including their orientations. Within each piece type,
+groups follow the deterministic slot order derived from `cube.py`. Each group
+is solved jointly while ignoring the other pieces. The scales preserve that
+priority exactly; the sum is a heuristic, not a solution-length lower bound,
+and does not guarantee faster solving or eliminate all local minima.
+The five pattern tables are built lazily once per process, before the search
+timer starts, using all 18 turns (a half turn costs one move). Their direct
+indexing uses about 1.6 MiB of distance data, including unused overlap entries;
+construction needs additional temporary memory. Nothing is saved to disk.
+Existing selection, block scoring, and the default fitness remain unchanged.
 
 Unlike the older scripts it has a `main()` guard and no import side effects.
 The input is still hardcoded: `default_input_cube()` is a fully scrambled cube
@@ -220,6 +238,8 @@ that interpreter if it is not already installed.
 uv run python solver_deap.py   # DEAP genetic algorithm
 uv run python solver.py        # needs combinations*.txt, see above
 uv run python solver_deap_coevolution.py --seed 42   # coevolution; --help lists options
+uv run python solver_deap_coevolution.py --fitness cubie-refined --seed 42
+uv run python solver_deap_coevolution.py --fitness grouped-cubie --seed 42
 uv run python -m unittest test_solver_deap_coevolution -v
 uv run python benchmark_coevolution.py   # ~15 minutes
 ```

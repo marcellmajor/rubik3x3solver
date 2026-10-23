@@ -316,6 +316,29 @@ class ObjectiveTests(unittest.TestCase):
         self.assertEqual(s.edge_cost(twisted), 1)
         self.assertFalse(s.is_solved_key(twisted))
 
+    def test_cubie_refined_cost_properties(self):
+        refined = s.make_objective("cubie-refined")
+        self.assertEqual((refined.state_function, refined.integer_valued), ("cubie-refined", True))
+        args = s.build_arg_parser().parse_args(["--fitness", "cubie-refined"])
+        self.assertEqual(s.validate_config(s.config_from_args(args)).state_function, "cubie-refined")
+        self.assertEqual(s.cubie_refined_cost(SOLVED_KEY), 0)
+        for allele in s.REAL_MOVES:
+            key = key_after(SOLVED_KEY, (allele,))
+            self.assertEqual(s.cubie_refined_cost(key),
+                             64 * s.cubie_cost(key) + s.misplaced_cost(key))
+            self.assertEqual(refined.cost(key), s.cubie_refined_cost(key))
+        rng = random.Random(11)
+        keys = [key_after(SOLVED_KEY, s.generate_reduced_block(rng.randint(1, 20), rng))
+                for _ in range(200)]
+        for key in keys:
+            self.assertEqual(s.cubie_refined_cost(key) == 0, s.is_solved_key(key))
+        # The refinement is exactly lexicographic: cubie first, then
+        # misplaced stickers; the lower tier never outweighs a cubie unit.
+        by_refined = sorted(keys, key=s.cubie_refined_cost)
+        by_tiers = sorted(keys, key=lambda key: (s.cubie_cost(key), s.misplaced_cost(key)))
+        self.assertEqual([s.cubie_refined_cost(key) for key in by_refined],
+                         [s.cubie_refined_cost(key) for key in by_tiers])
+
     def test_cubie_fitness_rejects_inconsistent_cubies(self):
         stickers = list(SOLVED_KEY)
         stickers[0], stickers[10] = stickers[10], stickers[0]  # a corner sticker trades places with an edge sticker
@@ -323,6 +346,9 @@ class ObjectiveTests(unittest.TestCase):
         s.validate_input_cube(cube)  # colour counts and centres still pass the general check
         with self.assertRaises(s.InvalidInputError):
             s.run_search(s.SearchConfig(fitness="cubie", seed=1, generations=0), cube, log=lambda message: None)
+        with self.assertRaises(s.InvalidInputError):
+            s.run_search(s.SearchConfig(fitness="cubie-refined", seed=1, generations=0), cube,
+                         log=lambda message: None)
         result = s.run_search(s.SearchConfig(seed=1, generations=0), cube, log=lambda message: None)
         self.assertEqual(result.status, s.STATUS_BUDGET_EXHAUSTED)
         s.validate_cubie_input(s.validate_input_cube(scrambled("R1 U2 C3 D1")))

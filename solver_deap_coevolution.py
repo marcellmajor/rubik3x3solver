@@ -21,6 +21,8 @@ Conventions used throughout this module:
   would need on its own to reach its home slot and orientation.
 * The "edges" objective counts the 20 blocks around the centres (8 corners and
   12 edges) that do not show all their correct colours.
+* "grouped-cubie" uses exact joint distances for five four-piece groups, with
+  solo cubie distance and misplaced stickers as lower-priority tie-breakers.
 * Solved detection is independent of the objective: every sticker must equal
   its own face centre.
 
@@ -43,6 +45,7 @@ import sys
 import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 from operator import itemgetter
 from typing import Optional
 
@@ -56,19 +59,21 @@ from cube import Cube
 # ---------------------------------------------------------------------------
 
 DEFAULT_FITNESS = "manhattan"
-DEFAULT_SOLUTION_POPULATION = 300
-DEFAULT_BLOCK_POPULATION = 120
+DEFAULT_SOLUTION_POPULATION = 1000
+DEFAULT_BLOCK_POPULATION = 250
 DEFAULT_SOLUTION_CAPACITY = 32
 DEFAULT_BLOCK_CAPACITY = 16
 DEFAULT_CONTEXT_COUNT = 16
-DEFAULT_GENERATIONS = 5000
+DEFAULT_GENERATIONS = 10000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
 DEFAULT_LOG_EVERY = 10
 DEFAULT_MANHATTAN_WEIGHT = 1.0
 DEFAULT_MISPLACED_WEIGHT = 1.0
 
-FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie", "edges")
-INTEGER_VALUED_FITNESS = ("manhattan", "manhattan-min", "misplaced", "cubie", "edges")
+FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie", "edges",
+                   "cubie-refined", "grouped-cubie")
+INTEGER_VALUED_FITNESS = ("manhattan", "manhattan-min", "misplaced", "cubie", "edges", "cubie-refined",
+                        "grouped-cubie")
 
 # Ordinary solution-offspring operators and their probabilities (section 7.5).
 SOLUTION_OPERATOR_PROBABILITIES = (
@@ -494,6 +499,47 @@ def edge_cost(key):
     return total
 
 
+# Lexicographic scale for cubie_refined_cost: the misplaced tier must never
+# outweigh one unit of cubie distance. Misplaced counts only non-centre
+# stickers (centres always match their own face), so it is at most 48 < 64.
+_CUBIE_REFINED_CUBIE_SCALE = 64
+
+
+def cubie_refined_cost(key):
+    """Cubie distance, refined within its ties by misplaced stickers.
+
+    ``cubie_cost`` alone leaves large plateaus of states with equal cost
+    between which selection has no gradient except active length. This cost
+    keeps the cubie distance strictly primary, then prefers more stickers
+    showing their own face's colour: ``64 * cubie + misplaced``.
+    """
+    return _CUBIE_REFINED_CUBIE_SCALE * cubie_cost(key) + misplaced_cost(key)
+
+
+@lru_cache(maxsize=1)
+def _grouped_cubie_tables():
+    """Build once, only when this fitness is used; no files or external solvers."""
+    from grouped_cubie_fitness import GroupedCubieTables
+
+    # Bound the lower tiers using the actual solo-distance tables.
+    if 64 * sum(max(table.values()) for _, table in _CUBIE_TABLES) + 48 >= 4096:
+        raise ConsistencyError("grouped-cubie scale no longer dominates its tie-breakers")
+    positions = tuple(range(STICKER_COUNT))
+    return GroupedCubieTables(_CUBIE_SLOTS, tuple(_MOVE_TABLES[a](positions) for a in REAL_MOVES))
+
+
+def grouped_cubie_cost(key):
+    """Joint four-piece distances, then solo distances, then misplaced stickers.
+
+    P sums two four-corner and three four-edge exact pattern distances under
+    all 18 moves. The sum is a heuristic, not a solution-length lower bound.
+    4096 dominates 64*C+M (C<=52, M<=48); 64 dominates M. Search length and
+    solved detection remain separate from this pure state cost.
+    """
+    pattern_sum = sum(_grouped_cubie_tables().distances(_face_indices(key)))
+    return 4096 * pattern_sum + cubie_refined_cost(key)
+
+
 @dataclass(frozen=True)
 class Objective:
     name: str
@@ -516,6 +562,10 @@ class Objective:
             return misplaced_cost(key)
         if self.state_function == "cubie":
             return cubie_cost(key)
+        if self.state_function == "cubie-refined":
+            return cubie_refined_cost(key)
+        if self.state_function == "grouped-cubie":
+            return grouped_cubie_cost(key)
         if self.state_function == "edges":
             return edge_cost(key)
         value = self.manhattan_weight * manhattan_cost(key) + self.misplaced_weight * misplaced_cost(key)
@@ -531,6 +581,12 @@ class Objective:
             return f"{self.name}: stickers differing from their face centre"
         if self.state_function == "cubie":
             return f"{self.name}: sum over the 20 cubies of each one's move distance to its home slot and orientation"
+        if self.state_function == "cubie-refined":
+            return (f"{self.name}: cubie distance first, then misplaced stickers "
+                    "(64 * cubie + misplaced)")
+        if self.state_function == "grouped-cubie":
+            return (f"{self.name}: joint four-piece distances, then cubie, then misplaced "
+                    "(4096 * pattern sum + 64 * cubie + misplaced; not a length lower bound)")
         if self.state_function == "edges":
             return (f"{self.name}: blocks around the centres (8 corners, 12 edges) "
                     "not showing all their correct colours")
@@ -547,7 +603,8 @@ def make_objective(name, manhattan_weight=None, misplaced_weight=None):
         if manhattan_weight is not None or misplaced_weight is not None:
             raise ConfigError("--manhattan-weight/--misplaced-weight are valid only with "
                               "--fitness manhattan-misplaced")
-        return Objective(name, name if name in ("misplaced", "cubie", "edges") else "manhattan")
+        return Objective(name, name if name in ("misplaced", "cubie", "edges", "cubie-refined",
+                                               "grouped-cubie") else "manhattan")
     weights = []
     for label, value, default in (
         ("manhattan", manhattan_weight, DEFAULT_MANHATTAN_WEIGHT),
@@ -1212,7 +1269,7 @@ class CoevolutionRun:
         self.history = tools.Logbook()
 
         self._last_report_marker = None
-        if objective.state_function == "cubie":
+        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie"):
             validate_cubie_input(input_key)
         baseline = self.normalize_solution((), check_budget=False)
         self.baseline = baseline
@@ -2241,7 +2298,7 @@ def main(argv=None, *, clock=None):
         objective = validate_config(config)
         input_cube = default_input_cube()
         input_key = validate_input_cube(input_cube)
-        if objective.state_function == "cubie":
+        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie"):
             validate_cubie_input(input_key)
     except (ConfigError, InvalidInputError) as exc:
         _print_status(STATUS_INVALID_INPUT, f"Invalid configuration or input: {exc}")
