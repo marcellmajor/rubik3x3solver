@@ -53,12 +53,12 @@ from cube import Cube
 # ---------------------------------------------------------------------------
 
 DEFAULT_FITNESS = "manhattan"
-DEFAULT_SOLUTION_POPULATION = 200
-DEFAULT_BLOCK_POPULATION = 100
+DEFAULT_SOLUTION_POPULATION = 2000
+DEFAULT_BLOCK_POPULATION = 1000
 DEFAULT_SOLUTION_CAPACITY = 32
 DEFAULT_BLOCK_CAPACITY = 16
 DEFAULT_CONTEXT_COUNT = 16
-DEFAULT_GENERATIONS = 1000
+DEFAULT_GENERATIONS = 5000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
 DEFAULT_LOG_EVERY = 10
 DEFAULT_MANHATTAN_WEIGHT = 1.0
@@ -322,9 +322,9 @@ def replay_key(start_key, sequence, counters=None):
 def default_input_cube():
     """The active checkpoint from ``solver_deap.py`` (its last ``my_cube`` assignment)."""
     return Cube(
-                                   "GGGWGGGOG",
-        ["RWRRRGRRR", "WRWRWWWWW", "OGOOOOOOO", "YYYYYYYYY"],
-                                   "BBBBBBBBB",
+                                   "WYRYGRGRY",
+        ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"],
+                                   "WGWRBBGWR",
     )
 
 
