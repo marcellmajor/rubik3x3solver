@@ -2,11 +2,13 @@
 
 import contextlib
 import io
+from pathlib import Path
 import random
 import string
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 import solver_deap_coevolution as s
 
@@ -85,6 +87,8 @@ class GroupedCubieTests(unittest.TestCase):
         recolour = str.maketrans("GRWOYB", "BYOWRG")
         for key in keys:
             self.assertEqual(objective.cost(key) == 0, s.is_solved_key(key))
+            self.assertEqual(objective.cost(key), 4096 * sum(self.distances(key))
+                             + 64 * s.cubie_cost(key) + s.misplaced_cost(key))
             self.assertEqual(objective.cost(key), objective.cost(key.translate(recolour)))
         by_tiers = sorted(keys, key=lambda k: (sum(self.distances(k)), s.cubie_cost(k), s.misplaced_cost(k)))
         self.assertEqual([objective.cost(k) for k in by_tiers], sorted(objective.cost(k) for k in keys))
@@ -124,9 +128,32 @@ class GroupedCubieTests(unittest.TestCase):
                                  "import solver_deap_coevolution as s; "
                                  "s.make_objective('grouped-cubie'); "
                                  "assert s._grouped_cubie_tables.cache_info().currsize == 0"],
+                                cwd=Path(__file__).resolve().parent,
                                 capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
+
+    def test_single_pass_score_matches_reference_on_random_walk(self):
+        rng = random.Random(445)
+        key = SOLVED
+        for _ in range(1000):
+            key = moved(key, rng.choice(s.REAL_MOVES))
+            expected = 4096 * sum(self.distances(key)) + 64 * s.cubie_cost(key) + s.misplaced_cost(key)
+            self.assertEqual(s.grouped_cubie_cost(key), expected)
+
+    def test_duplicate_cubies_and_unreached_entries_are_rejected(self):
+        faces = list(s._face_indices(SOLVED))
+        first, second = [slot for slot in s._CUBIE_SLOTS if len(slot) == 2][:2]
+        for source, target in zip(first, second):
+            faces[target] = faces[source]
+        for evaluate in (self.tables.cost, self.tables.distances):
+            with self.assertRaisesRegex(ValueError, "repeat"):
+                evaluate("".join(faces))
+        tables = self.tables._distance_tables
+        with mock.patch.object(self.tables, "_distance_tables", (bytes([255]) * len(tables[0]), *tables[1:])):
+            for evaluate in (self.tables.cost, self.tables.distances):
+                with self.assertRaisesRegex(ValueError, "unreachable"):
+                    evaluate(s._face_indices(SOLVED))
 
 
 if __name__ == "__main__":

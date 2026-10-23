@@ -195,13 +195,15 @@ The five pattern tables are built lazily once per process, before the search
 timer starts, using all 18 turns (a half turn costs one move). Their direct
 indexing uses about 1.6 MiB of distance data, including unused overlap entries;
 construction needs additional temporary memory. Nothing is saved to disk.
+Scoring decodes each piece once: a lookup supplies its pattern-index
+contribution, solo distance, and misplaced-sticker count together.
 Existing selection, block scoring, and the default fitness remain unchanged.
 
 Unlike the older scripts it has a `main()` guard and no import side effects.
 The input is still hardcoded: `default_input_cube()` is a fully scrambled cube
 (`H` = 198 under `manhattan`, cubie cost 32). Other cubes can go through the
-library call `run_search(SearchConfig(...), cube)`. Defaults: 300 solutions,
-120 blocks, 5000 generations, solution capacity 32, block capacity 16 and 16
+library call `run_search(SearchConfig(...), cube)`. Defaults: 1000 solutions,
+250 blocks, 10000 generations, solution capacity 32, block capacity 16 and 16
 contexts. Main options: `--seed`, `--fitness`, `--time-limit`,
 `--generations`, the population, capacity and context sizes, and `--plot`
 (saves `coevolution_progress.png` without opening a window). Exit codes: `0`

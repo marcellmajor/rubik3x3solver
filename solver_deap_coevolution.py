@@ -536,8 +536,7 @@ def grouped_cubie_cost(key):
     4096 dominates 64*C+M (C<=52, M<=48); 64 dominates M. Search length and
     solved detection remain separate from this pure state cost.
     """
-    pattern_sum = sum(_grouped_cubie_tables().distances(_face_indices(key)))
-    return 4096 * pattern_sum + cubie_refined_cost(key)
+    return _grouped_cubie_tables().cost(_face_indices(key))
 
 
 @dataclass(frozen=True)

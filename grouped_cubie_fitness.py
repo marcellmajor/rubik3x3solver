@@ -81,13 +81,13 @@ class GroupedCubieTables:
         decoders = [{} for _ in slots]
         transitions, home_poses = [], []
         for member, home in enumerate(slots):
-            placements = {home}
+            placements = {home: 0}
             pending = [home]
             for placement in pending:
                 for destination in destinations:
                     moved = tuple(destination[p] for p in placement)
                     if moved not in placements:
-                        placements.add(moved)
+                        placements[moved] = placements[placement] + 1
                         pending.append(moved)
             poses = sorted(placements)
             if len(poses) != POSE_COUNT:
@@ -102,10 +102,9 @@ class GroupedCubieTables:
             for pose_id, placement in enumerate(poses):
                 slot = slot_index[frozenset(placement)]
                 label_at = dict(zip(placement, labels))
-                label = "".join(label_at[p] for p in slots[slot])
-                decoders[slot][label] = (member, pose_id)
-        self._decoders = tuple((itemgetter(*slot), decoder)
-                               for slot, decoder in zip(slots, decoders))
+                label = tuple(label_at[p] for p in slots[slot])
+                misplaced = sum(color != str(p // 9) for color, p in zip(label, slots[slot]))
+                decoders[slot][label] = (member, pose_id, 64 * placements[placement] + misplaced)
         patterns = []
         for size, expected_count in ((3, 136080), (2, 190080)):
             members = [i for i, slot in enumerate(slots) if len(slot) == size]
@@ -113,17 +112,50 @@ class GroupedCubieTables:
                 patterns.append(_build_pattern(members[start:start + 4], home_poses,
                                                transitions, expected_count))
         self.patterns = tuple(patterns)
+        # A slot observation already determines its piece, pose, solo distance
+        # and misplaced stickers. Precompute its contribution to the group's
+        # base-24 index and the two lower score tiers. No second cubie/sticker
+        # scan or per-piece string construction is needed during evaluation.
+        membership = {member: (group, POSE_COUNT ** (3 - digit))
+                      for group, pattern in enumerate(patterns)
+                      for digit, member in enumerate(pattern.members)}
+        self._decoders = tuple(
+            (itemgetter(*slot), {
+                label: (membership[member][0], pose * membership[member][1], lower, 1 << member)
+                for label, (member, pose, lower) in decoder.items()
+            }) for slot, decoder in zip(slots, decoders)
+        )
+        self._all_members = (1 << len(slots)) - 1
+        self._distance_tables = tuple(pattern.distances for pattern in patterns)
+
+    def _decode(self, face_indices):
+        """Decode all five indices and 64*cubie+misplaced in one pass."""
+        indices = [0] * 5
+        lower = seen = 0
+        try:
+            for getter, decoder in self._decoders:
+                group, contribution, tie_break, member_bit = decoder[getter(face_indices)]
+                indices[group] += contribution
+                lower += tie_break
+                seen |= member_bit
+        except KeyError:
+            raise ValueError("the stickers do not form a consistent set of cubies") from None
+        if seen != self._all_members:
+            raise ValueError("the stickers repeat a cubie")
+        return indices, lower
+
+    def _lookup(self, indices):
+        distances = tuple(table[index] for table, index in zip(self._distance_tables, indices))
+        if UNREACHED in distances:
+            raise ValueError("the stickers form an unreachable cubie pattern")
+        return distances
 
     def distances(self, face_indices):
         """Return five exact distances for a key labelled by centre indices 0..5."""
-        poses = [-1] * len(self._decoders)
-        try:
-            for getter, decoder in self._decoders:
-                member, pose = decoder["".join(getter(face_indices))]
-                if poses[member] != -1:
-                    raise ValueError("the stickers repeat a cubie")
-                poses[member] = pose
-        except KeyError:
-            raise ValueError("the stickers do not form a consistent set of cubies") from None
-        return tuple(pattern.distances[_pattern_index(tuple(poses[m] for m in pattern.members))]
-                     for pattern in self.patterns)
+        indices, _ = self._decode(face_indices)
+        return self._lookup(indices)
+
+    def cost(self, face_indices):
+        """Return 4096*pattern_sum + 64*cubie + misplaced with one decoding."""
+        indices, lower = self._decode(face_indices)
+        return 4096 * sum(self._lookup(indices)) + lower
