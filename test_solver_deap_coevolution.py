@@ -264,6 +264,10 @@ class ObjectiveTests(unittest.TestCase):
         self.assertEqual(s.validate_config(s.config_from_args(args)).state_function, "manhattan")
         self.assertEqual(s.make_objective("manhattan-min").state_function, "manhattan")
         self.assertEqual(s.make_objective("misplaced").state_function, "misplaced")
+        edges = s.make_objective("edges")
+        self.assertEqual((edges.state_function, edges.integer_valued), ("edges", True))
+        args = s.build_arg_parser().parse_args(["--fitness", "edges"])
+        self.assertEqual(s.validate_config(s.config_from_args(args)).state_function, "edges")
         cubie = s.make_objective("cubie")
         self.assertEqual((cubie.state_function, cubie.integer_valued), ("cubie", True))
         args = s.build_arg_parser().parse_args(["--fitness", "cubie"])
@@ -286,6 +290,27 @@ class ObjectiveTests(unittest.TestCase):
             self.assertEqual(cost == 0, s.is_solved_key(key))
             self.assertEqual(s.cubie_cost(key.translate(recolour)), cost)  # depends on centres, not colour names
             self.assertEqual(s.make_objective("cubie").cost(key), cost)
+
+    def test_edge_cost_properties(self):
+        self.assertEqual(s.EDGE_STICKER_POSITIONS, tuple(sorted(f * 9 + i for f in range(6) for i in (1, 3, 5, 7))))
+        self.assertEqual(s.edge_cost(SOLVED_KEY), 0)
+        for allele in s.REAL_MOVES:  # a turn moves 4 edges; each puts one sticker on a foreign face
+            self.assertEqual(s.edge_cost(key_after(SOLVED_KEY, (allele,))), 4)
+        rng = random.Random(7)
+        for _ in range(200):
+            key = key_after(SOLVED_KEY, s.generate_reduced_block(rng.randint(1, 20), rng))
+            expected = sum(key[f * 9 + i] != key[f * 9 + 4] for f in range(6) for i in (1, 3, 5, 7))
+            self.assertEqual(s.edge_cost(key), expected)
+            self.assertLessEqual(s.edge_cost(key), s.misplaced_cost(key))
+            self.assertEqual(s.make_objective("edges").cost(key), expected)
+        # Corners are not scored: twisting one corner's stickers leaves the edge cost at 0, but not solved.
+        stickers = list(SOLVED_KEY)
+        corner = next(slot for slot in s._CUBIE_SLOTS if len(slot) == 3)
+        for position, colour in zip(corner, [stickers[p] for p in corner[1:] + corner[:1]]):
+            stickers[position] = colour
+        twisted = "".join(stickers)
+        self.assertEqual(s.edge_cost(twisted), 0)
+        self.assertFalse(s.is_solved_key(twisted))
 
     def test_cubie_fitness_rejects_inconsistent_cubies(self):
         stickers = list(SOLVED_KEY)
@@ -324,6 +349,8 @@ class ObjectiveTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("Status: INVALID_INPUT", output)
         code, _ = quiet(s.main, ["--fitness", "cubie", "--manhattan-weight", "1"])
+        self.assertEqual(code, 2)
+        code, _ = quiet(s.main, ["--fitness", "edges", "--misplaced-weight", "1"])
         self.assertEqual(code, 2)
         code, _ = quiet(s.main, ["--fitness", "manhattan-misplaced", "--manhattan-weight", "nan"])
         self.assertEqual(code, 2)
@@ -838,6 +865,14 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual([record["gen"] for record in result.history], [0, 1, 2, 3, 4, 5])
         self.assertGreater(result.counters.block_sequence_evaluations, 0)
         self.assertEqual(result.counters.baseline_start_attempts, 5)
+
+    def test_edges_fitness_solves_short_scrambles(self):
+        for moves in ("R1", "R1 U1"):
+            with self.subTest(moves=moves):
+                result = s.run_search(s.SearchConfig(fitness="edges", seed=2, generations=30, solution_population=20,
+                                                     block_population=20), scrambled(moves), log=lambda message: None)
+                self.assertEqual(s.finalize_result(result).status, s.STATUS_SOLVED)
+                self.assertTrue(s.is_solved_key(key_after(result.input_key, result.archive.active)))
 
     def test_cubie_fitness_solves_short_scrambles(self):
         for moves in ("R1", "R1 U1"):

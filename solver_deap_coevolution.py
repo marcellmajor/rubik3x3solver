@@ -19,6 +19,8 @@ Conventions used throughout this module:
   on solution length.
 * The "cubie" objective sums, over the 20 corner and edge cubies, the moves each
   would need on its own to reach its home slot and orientation.
+* The "edges" objective counts the 24 edge stickers that differ from their own
+  face centre. Corners are not scored, so it cannot steer a full solve alone.
 * Solved detection is independent of the objective: every sticker must equal
   its own face centre.
 
@@ -65,8 +67,8 @@ DEFAULT_LOG_EVERY = 10
 DEFAULT_MANHATTAN_WEIGHT = 1.0
 DEFAULT_MISPLACED_WEIGHT = 1.0
 
-FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie")
-INTEGER_VALUED_FITNESS = ("manhattan", "manhattan-min", "misplaced", "cubie")
+FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie", "edges")
+INTEGER_VALUED_FITNESS = ("manhattan", "manhattan-min", "misplaced", "cubie", "edges")
 
 # Ordinary solution-offspring operators and their probabilities (section 7.5).
 SOLUTION_OPERATOR_PROBABILITIES = (
@@ -436,10 +438,10 @@ def _build_cubie_tables():
             index = slot_index[frozenset(placement)]
             label_at = dict(zip(placement, labels))
             tables[index]["".join(label_at[position] for position in slots[index])] = steps
-    return tuple((itemgetter(*slot), table) for slot, table in zip(slots, tables))
+    return tuple(slots), tuple((itemgetter(*slot), table) for slot, table in zip(slots, tables))
 
 
-_CUBIE_TABLES = _build_cubie_tables()
+_CUBIE_SLOTS, _CUBIE_TABLES = _build_cubie_tables()
 _FACE_INDEX_TRANSLATIONS = {}
 
 
@@ -476,6 +478,20 @@ def validate_cubie_input(key):
         raise InvalidInputError("the stickers repeat a cubie, so they are not a consistent set of cubies")
 
 
+# The 24 edge stickers (two on each of the 12 edge cubies), each paired with its face centre.
+EDGE_STICKER_POSITIONS = tuple(sorted(position for slot in _CUBIE_SLOTS if len(slot) == 2 for position in slot))
+_EDGE_STICKER_CENTRES = tuple((position, (position // 9) * 9 + 4) for position in EDGE_STICKER_POSITIONS)
+
+
+def edge_cost(key):
+    """Edge stickers whose colour differs from their own face centre (0-24); corners are not scored."""
+    total = 0
+    for position, centre in _EDGE_STICKER_CENTRES:
+        if key[position] != key[centre]:
+            total += 1
+    return total
+
+
 @dataclass(frozen=True)
 class Objective:
     name: str
@@ -498,6 +514,8 @@ class Objective:
             return misplaced_cost(key)
         if self.state_function == "cubie":
             return cubie_cost(key)
+        if self.state_function == "edges":
+            return edge_cost(key)
         value = self.manhattan_weight * manhattan_cost(key) + self.misplaced_weight * misplaced_cost(key)
         if not math.isfinite(value):
             raise NumericalError(f"non-finite state cost {value!r}")
@@ -511,6 +529,8 @@ class Objective:
             return f"{self.name}: stickers differing from their face centre"
         if self.state_function == "cubie":
             return f"{self.name}: sum over the 20 cubies of each one's move distance to its home slot and orientation"
+        if self.state_function == "edges":
+            return f"{self.name}: edge stickers (24) that differ from their face centre; corners are not scored"
         alias =" (compatibility alias of manhattan)" if self.name == "manhattan-min" else ""
         return (f"{self.name}{alias}: colour/face-offset mismatch heuristic "
                 "(not a geometric distance, not a lower bound)")
@@ -524,7 +544,7 @@ def make_objective(name, manhattan_weight=None, misplaced_weight=None):
         if manhattan_weight is not None or misplaced_weight is not None:
             raise ConfigError("--manhattan-weight/--misplaced-weight are valid only with "
                               "--fitness manhattan-misplaced")
-        return Objective(name, name if name in ("misplaced", "cubie") else "manhattan")
+        return Objective(name, name if name in ("misplaced", "cubie", "edges") else "manhattan")
     weights = []
     for label, value, default in (
         ("manhattan", manhattan_weight, DEFAULT_MANHATTAN_WEIGHT),

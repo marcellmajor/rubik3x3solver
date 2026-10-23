@@ -169,18 +169,21 @@ Moves use the same `R L U D C B` letters with counts `1..3`, plus `NOOP`. A
 shared simplifier merges same-face turns and commutes opposite faces (`R`/`L`,
 `U`/`D`, `C`/`B`), so reported lengths are reduced, not globally minimal.
 `--fitness` picks `H`: `manhattan` (default, the heuristic above as a pure
-function), `misplaced`, the weighted `manhattan-misplaced`, or `cubie`: the sum
-over the 20 corner and edge cubies of the moves each would need on its own to
-reach its home slot and orientation. `cubie` rejects an input whose stickers
-do not form a consistent set of cubies. Solved means every sticker matches its
+function), `misplaced`, the weighted `manhattan-misplaced`, `cubie`, or
+`edges`. `cubie` is the sum over the 20 corner and edge cubies of the moves
+each would need on its own to reach its home slot and orientation; it rejects
+an input whose stickers do not form a consistent set of cubies. `edges` counts
+only the 24 edge stickers (the middle of each face's border) that differ from
+their face centre, so corners are not scored and it cannot steer a full solve
+on its own. Solved means every sticker matches its
 face centre, whatever `H` is in use, and every reported result is replayed
 from the original cube before it counts.
 
 Unlike the older scripts it has a `main()` guard and no import side effects.
 The input is still hardcoded: `default_input_cube()` is a fully scrambled cube
 (`H` = 198 under `manhattan`, cubie cost 32). Other cubes can go through the
-library call `run_search(SearchConfig(...), cube)`. Defaults: 2000 solutions,
-1000 blocks, 5000 generations, solution capacity 32, block capacity 16 and 16
+library call `run_search(SearchConfig(...), cube)`. Defaults: 300 solutions,
+120 blocks, 5000 generations, solution capacity 32, block capacity 16 and 16
 contexts. Main options: `--seed`, `--fitness`, `--time-limit`,
 `--generations`, the population, capacity and context sizes, and `--plot`
 (saves `coevolution_progress.png` without opening a window). Exit codes: `0`
@@ -234,8 +237,9 @@ script you run, keeping exactly nine stickers of each colour —
   starts from a hardcoded input cube. Dependencies are installed with uv.
 - The coevolution solver solves short scrambles (up to about 6 moves in
   testing) but did not get past the active checkpoint's plateau in the
-  benchmark. On the scrambled default it typically reaches `H` 60–80 within
-  30 generations and then stalls; none of those test runs solved it.
+  benchmark. On the scrambled default, with 2000 solutions and 1000 blocks, it
+  typically reached `H` 60–80 within 30 generations and then stalled; none of
+  those test runs solved it.
 - Fitness is a heuristic, not an admissible bound: search can stall at local
   optima and solutions are neither guaranteed nor minimal.
 - Exhaustive modes materialise every combination in memory/on disk and do
