@@ -39,6 +39,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from operator import itemgetter
 from typing import Optional
 
 from deap import base, creator, tools
@@ -251,6 +252,15 @@ def is_solved_key(key):
     return True
 
 
+def copy_cube(cube):
+    """Independent copy without ``deepcopy``.
+
+    cube.py moves only rebind face strings and list items (strings are
+    immutable), so copying the face list is enough.
+    """
+    return Cube(cube.top_face, list(cube.row_of_faces), cube.bottom_face)
+
+
 def apply_move(cube, allele, counters=None):
     if allele == NOOP:
         return
@@ -262,13 +272,49 @@ def apply_move(cube, allele, counters=None):
 
 
 def replay(start_cube, sequence, counters=None):
-    """Apply ``sequence`` to an independent clone of ``start_cube``."""
-    cube = start_cube.clone()
+    """Apply ``sequence`` to an independent copy of ``start_cube`` with cube.py's rotations."""
+    cube = copy_cube(start_cube)
     if counters is not None:
         counters.cube_clones += 1
     for allele in active_moves(sequence):
         apply_move(cube, allele, counters)
     return cube
+
+
+def _build_move_tables():
+    """Sticker permutation of every allele, taken from cube.py's own rotations.
+
+    Applying a move to a uniquely labelled cube shows where each sticker comes
+    from; ``table(key)`` then returns the moved key's stickers in order.
+    """
+    labels = "".join(chr(ord("0") + index) for index in range(STICKER_COUNT))
+    tables = [None]
+    for allele in REAL_MOVES:
+        cube = cube_from_key(labels)
+        apply_move(cube, allele)
+        tables.append(itemgetter(*(labels.index(sticker) for sticker in state_key(cube))))
+    return tuple(tables)
+
+
+_MOVE_TABLES = _build_move_tables()
+
+
+def apply_move_to_key(key, allele, counters=None):
+    """Return the state key after one move; same result as :func:`apply_move` on a cube."""
+    if allele == NOOP:
+        return key
+    if counters is not None:
+        counters.quarter_turns += _ALLELE_TURNS[allele]
+        counters.move_applications += 1
+    return "".join(_MOVE_TABLES[allele](key))
+
+
+def replay_key(start_key, sequence, counters=None):
+    """State key after applying ``sequence`` to ``start_key`` through the move tables."""
+    key = start_key
+    for allele in active_moves(sequence):
+        key = apply_move_to_key(key, allele, counters)
+    return key
 
 
 def default_input_cube():
@@ -797,7 +843,6 @@ class Context:
     group: str
     cost: float
     solved: bool
-    cube: Cube = field(repr=False, compare=False)
     source_runs: tuple = field(repr=False)
     source_length: int = 0
 
@@ -1064,10 +1109,6 @@ class CoevolutionRun:
         self._next_uid += 1
         return self._next_uid
 
-    def fresh_original(self):
-        self.counters.cube_clones += 1
-        return self._original.clone()
-
     def make_solution(self, candidate, *, origin, operator=None, parents=(), block_id=None, uid=None):
         individual = self.SolutionClass(pad_chromosome(candidate.active, self.solution_capacity))
         individual.uid = self.new_uid() if uid is None else uid
@@ -1128,9 +1169,8 @@ class CoevolutionRun:
     # -- solution normalisation (section 6) ----------------------------------------
 
     def _best_prefix(self, moves, check_budget):
-        cube = self.fresh_original()
         reducer = MoveReducer()
-        key = state_key(cube)
+        key = self.input_key
         cost = self.cost(key)
         solved = is_solved_key(key)
         best = (0, key, cost, solved)
@@ -1141,9 +1181,8 @@ class CoevolutionRun:
         for index, allele in enumerate(moves, 1):
             if check_budget:
                 self.budget.check()
-            apply_move(cube, allele, counters)
+            key = apply_move_to_key(key, allele, counters)
             reducer.push(allele)
-            key = state_key(cube)
             cost = self.cost(key)
             solved = is_solved_key(key)
             rank = (0 if solved else 1, cost, reducer.length)
@@ -1178,7 +1217,7 @@ class CoevolutionRun:
         return candidate
 
     def _verify_candidate(self, candidate):
-        """Independent replay from a fresh original clone; raise on any disagreement."""
+        """Independent replay through cube.py's rotations (not the move tables); raise on disagreement."""
         self.counters.independent_replays += 1
         if len(candidate.active) > self.solution_capacity:
             raise ConsistencyError("candidate exceeds the solution capacity")
@@ -1216,8 +1255,7 @@ class CoevolutionRun:
                 raise ConsistencyError("context source does not replay to its state")
             reducer = MoveReducer.from_moves(source)
             contexts.append(Context(context_id, key, tuple(source), source_uid, group, self.cost(key),
-                                    is_solved_key(key), cube_from_key(key), tuple(reducer.runs),
-                                    reducer.length))
+                                    is_solved_key(key), tuple(reducer.runs), reducer.length))
         identity = (self.objective.identity, self.solution_capacity,
                     tuple((context.key, context.source) for context in contexts))
         self._batch_serial += 1
@@ -1264,9 +1302,8 @@ class CoevolutionRun:
         )
 
     def _evaluate_block_on_context(self, sequence, context, block_uid):
-        """Replay the whole block on a clone of the context and inspect every prefix."""
-        cube = context.cube.clone()
-        self.counters.cube_clones += 1
+        """Replay the whole block from the context's state key and inspect every prefix."""
+        key = context.key
         reducer = MoveReducer(context.source_runs, context.source_length)
         scale = max(context.cost, 1.0)
         capacity = self.solution_capacity
@@ -1277,9 +1314,8 @@ class CoevolutionRun:
         best_preference = None
         for k, allele in enumerate(sequence, 1):
             self.budget.check()
-            apply_move(cube, allele, self.counters)
+            key = apply_move_to_key(key, allele, self.counters)
             reducer.push(allele)
-            key = state_key(cube)
             cost = self.cost(key)
             delta = context.cost - cost
             solved = not context.solved and is_solved_key(key)

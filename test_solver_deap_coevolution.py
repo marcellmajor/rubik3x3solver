@@ -113,6 +113,28 @@ class SimplifierTests(unittest.TestCase):
             self.assertNotEqual(key_after(LABELED_KEY, f"{first}1 {second}1"),
                                 key_after(LABELED_KEY, f"{second}1 {first}1"))
 
+    def test_move_tables_match_cube_rotations(self):
+        for allele in s.REAL_MOVES:
+            self.assertEqual(s.apply_move_to_key(LABELED_KEY, allele), key_after(LABELED_KEY, (allele,)))
+        self.assertEqual(s.apply_move_to_key(LABELED_KEY, s.NOOP), LABELED_KEY)
+        rng = random.Random(21)
+        for _ in range(500):
+            sequence = tuple(rng.randrange(19) for _ in range(rng.randint(0, 40)))
+            self.assertEqual(s.replay_key(LABELED_KEY, sequence), key_after(LABELED_KEY, sequence))
+        counters = s.SearchCounters()
+        s.replay_key(LABELED_KEY, s.parse_moves("R1 U2 NOOP C3"), counters)
+        self.assertEqual((counters.quarter_turns, counters.move_applications), (6, 3))
+
+    def test_structural_copy_is_independent(self):
+        original = s.cube_from_key(LABELED_KEY)
+        copy = s.copy_cube(original)
+        self.assertIsNot(copy.row_of_faces, original.row_of_faces)
+        self.assertEqual(s.state_key(copy), LABELED_KEY)
+        for allele in s.REAL_MOVES:
+            s.apply_move(copy, allele)
+        self.assertEqual(s.state_key(original), LABELED_KEY)
+        self.assertNotEqual(s.state_key(copy), LABELED_KEY)
+
     def test_cube_inverse_is_not_reversal(self):
         sequence = s.parse_moves("R1 U2 C3")
         self.assertEqual(s.cube_inverse(sequence), s.parse_moves("C1 U2 R3"))
@@ -415,11 +437,12 @@ class PopulationPolicyTests(unittest.TestCase):
         copy[0] = s.NOOP
         self.assertNotEqual(record[0], s.NOOP)
         batch = run.build_context_batch([record] + [run.baseline_record("x") for _ in range(9)])
-        for context in batch.contexts:
-            self.assertIsNot(context.cube, run._original)
-        before = s.state_key(batch.contexts[0].cube)
-        s.apply_move(batch.contexts[0].cube.clone(), 1)
-        self.assertEqual(s.state_key(batch.contexts[0].cube), before)
+        self.assertTrue(all(isinstance(context.key, str) for context in batch.contexts))
+        block = run.make_block(s.parse_moves("U3 D1 B2"), origin="fixture")
+        run.evaluate_blocks([block], batch)
+        self.assertEqual([context.key for context in batch.contexts], [run.input_key, record.endpoint])
+        self.assertEqual(s.state_key(run._original), run.input_key)
+        s.replay(run._original, s.parse_moves("R1 U2"))
         self.assertEqual(s.state_key(run._original), run.input_key)
 
 
