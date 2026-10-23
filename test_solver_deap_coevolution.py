@@ -23,6 +23,22 @@ from unittest import mock
 import solver_deap_coevolution as s
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+_saved_environment = {}
+
+
+def setUpModule():
+    # The CLI uses the shared block library by default; keep every test away from the real one.
+    _saved_environment["XDG_DATA_HOME"] = os.environ.get("XDG_DATA_HOME")
+    _saved_environment["directory"] = tempfile.mkdtemp()
+    os.environ["XDG_DATA_HOME"] = _saved_environment["directory"]
+
+
+def tearDownModule():
+    shutil.rmtree(_saved_environment["directory"], ignore_errors=True)
+    if _saved_environment["XDG_DATA_HOME"] is None:
+        os.environ.pop("XDG_DATA_HOME", None)
+    else:
+        os.environ["XDG_DATA_HOME"] = _saved_environment["XDG_DATA_HOME"]
 SOLVED_KEY = "G" * 9 + "R" * 9 + "W" * 9 + "O" * 9 + "Y" * 9 + "B" * 9
 LABELED_KEY = (string.ascii_letters + "01")[:54]
 # The spec's active checkpoint from solver_deap.py (section 3.1), independent of the module default.
@@ -399,7 +415,7 @@ class ObjectiveTests(unittest.TestCase):
     def test_config_validation(self):
         bad = [
             dict(solution_population=7), dict(solution_population=0), dict(block_population=15),
-            dict(block_capacity=40), dict(solution_capacity=0), dict(contexts=0), dict(log_every=0),
+            dict(solution_capacity=32, block_capacity=40), dict(solution_capacity=0), dict(contexts=0), dict(log_every=0),
             dict(generations=-1), dict(min_block_gain=0.0), dict(min_block_gain=float("inf")),
             dict(time_limit=0.0), dict(time_limit=float("nan")),
         ]
@@ -508,18 +524,20 @@ class PopulationPolicyTests(unittest.TestCase):
         self.assertEqual(s.op_insert_block((), (7,), rng), (7,))
 
     def test_empty_and_one_move_parents_generate_active_offspring(self):
-        # A small block population keeps generation-1 blocks from solving this 3-move scramble outright.
+        # Test variation independently of archive termination: a child or block
+        # may legitimately solve this short fixture during repeated sampling.
         run = make_run(scrambled("R1 U1 C1"), solution_population=10, block_population=100)
         run.population = run.initial_solution_population()
         run.blocks = run.initial_block_population()
         batch = run.build_context_batch(run.population)
-        run.evaluate_blocks(run.blocks, batch)
-        run._index_blocks(run.blocks, batch)
-        one_move = run.make_solution(run.normalize_solution(s.parse_moves("C3")), origin="fixture")
-        for pool in ([run.population[0]], [one_move]):
-            children = [run._ordinary_offspring(pool) for _ in range(200)]
-            self.assertTrue(any(child.active and child.active != pool[0].active for child in children))
-            self.assertTrue(all(len(child.active) <= run.solution_capacity for child in children))
+        with mock.patch.object(run, "offer_to_archive", return_value=False):
+            run.evaluate_blocks(run.blocks, batch)
+            run._index_blocks(run.blocks, batch)
+            one_move = run.make_solution(run.normalize_solution(s.parse_moves("C3")), origin="fixture")
+            for pool in ([run.population[0]], [one_move]):
+                children = [run._ordinary_offspring(pool) for _ in range(200)]
+                self.assertTrue(any(child.active and child.active != pool[0].active for child in children))
+                self.assertTrue(all(len(child.active) <= run.solution_capacity for child in children))
         operators = {child.operator for child in children}
         self.assertTrue(operators & {"delete-gene", "substitute-gene", "cube-inverse", "span-replace"})
 
@@ -873,7 +891,7 @@ class BlockTests(unittest.TestCase):
 
 class IntegrationTests(unittest.TestCase):
     SMALL = ["--solution-population", "10", "--block-population", "10", "--solution-capacity", "8",
-             "--block-capacity", "4", "--contexts", "4", "--seed", "5"]
+             "--block-capacity", "4", "--contexts", "4", "--seed", "5", "--no-block-library"]
 
     def test_import_has_no_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:

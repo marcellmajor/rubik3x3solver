@@ -203,12 +203,76 @@ Unlike the older scripts it has a `main()` guard and no import side effects.
 The input is still hardcoded: `default_input_cube()` is a fully scrambled cube
 (`H` = 198 under `manhattan`, cubie cost 32). Other cubes can go through the
 library call `run_search(SearchConfig(...), cube)`. Defaults: 1000 solutions,
-250 blocks, 10000 generations, solution capacity 32, block capacity 16 and 16
+500 blocks, 10000 generations, solution capacity 64, block capacity 24 and 16
 contexts. Main options: `--seed`, `--fitness`, `--time-limit`,
 `--generations`, the population, capacity and context sizes, and `--plot`
 (saves `coevolution_progress.png` without opening a window). Exit codes: `0`
 verified solve, `1` budget exhausted, `2` invalid input, `3` internal or
 replay error, `130` interrupted.
+
+### Population diversity and stagnation warnings
+
+After every 50th completed generation the solver measures the solution
+population and prints a short summary
+([specification](solution_population_diversity_specs.md)). It only measures and
+warns; selection, mutation and every other part of the search are unchanged.
+
+- **Reset slots excluded:** the three diversity thresholds use the non-reset
+  candidates (elites, offspring and baseline-start offspring, empty ones
+  included). The current generation's 20% reset slots, which are intentionally
+  identical, are excluded; whole-population values are shown for context only.
+- **Warnings** (any one is enough; all active ones are listed together):
+  `LOW_UNIQUE_STATES` below 10% distinct endpoint states, `DOMINANT_STATE` one
+  state holding over 80%, `LOW_CUBIE_SPREAD` an exact mean below 2 differing
+  cubies (position or orientation, out of 20) between candidates, and
+  `NO_QUALITY_PROGRESS` 100 or more generations without a better
+  `(solved, H)`. A shorter sequence at the same `H` does not count as progress.
+- **Low diversity is not the same as a stalled search:** a population can
+  converge while approaching a solution, and progress can stall in a diverse
+  population, so each warning says which it is. A recovery note appears once
+  when no threshold is crossed any more.
+- `--diversity-min-unique-ratio`, `--diversity-max-dominance`,
+  `--diversity-min-cubie-distance` and `--stagnation-generations` change the
+  thresholds (not the 50-generation schedule); `--no-diversity-checks` turns the
+  feature off. Each check's record is attached to that generation's history row
+  and to `RunResult.diversity_records`.
+- The checks add a few milliseconds per checkpoint and count toward
+  `--time-limit`, so a time-limited run may complete slightly fewer generations;
+  fixed-generation runs produce exactly the same search with the checks on or off.
+
+### Persistent move-block library
+
+The CLI keeps a shared library of up to 100 distinct move blocks across runs,
+independent of the starting cube, seed and `--fitness`
+([specification](persistent_move_block_library_specs.md)). It lives at
+`$XDG_DATA_HOME/rubik3x3solver/move_blocks_v1.json` (else
+`~/.local/share/...`); `--block-library PATH` overrides it and
+`--no-block-library` turns all library reads, writes, scoring and seeding off,
+reproducing the plain search exactly. Library callers opt in with
+`SearchConfig(block_library=path)`; it is off by default there.
+
+- **Distinct** means a different 54-sticker permutation: `R1 R1` and `R2`, or
+  two spellings of the same algorithm, share one slot, keeping the shortest
+  known sequence. Identity blocks are dropped.
+- **Best** means the ranking on a fixed, versioned panel of 48 scrambles,
+  scored with `64 * cubie + misplaced` whatever the run's objective: more
+  solved panel states, then more improved ones, then the larger summed relative
+  gain, then fewer moves. The complete block is scored, never its best prefix.
+- Candidates are submitted after the first block batch, every 50th generation
+  and at the end, plus the exact blocks behind each new best solution. Reference
+  scoring counts against the time budget and stops at it without saving
+  partial scores.
+- A new run seeds at most a quarter of its first block population from the
+  library (blocks that fit `--block-capacity`), fills the rest with fresh
+  blocks, and scores every block on its own contexts before selection.
+- The file is plain JSON, validated in full before use. Saves merge with the
+  latest file under an OS lock and replace it atomically. A corrupt,
+  incompatible or locked library is reported, left untouched and never changes
+  the solver's result.
+  A failed load disables further library collection and scoring for that run.
+  After timeout or interruption, saves can use already verified cached scores;
+  if concurrent additions require fresh reference scoring, the save is deferred
+  with a diagnostic and the current disk file is preserved.
 
 ## Benchmark ([benchmark_coevolution.py](benchmark_coevolution.py))
 
@@ -242,7 +306,11 @@ uv run python solver.py        # needs combinations*.txt, see above
 uv run python solver_deap_coevolution.py --seed 42   # coevolution; --help lists options
 uv run python solver_deap_coevolution.py --fitness cubie-refined --seed 42
 uv run python solver_deap_coevolution.py --fitness grouped-cubie --seed 42
+uv run python solver_deap_coevolution.py --seed 42 --block-library my_blocks.json
+uv run python solver_deap_coevolution.py --seed 42 --no-block-library
 uv run python -m unittest test_solver_deap_coevolution -v
+uv run python -m unittest test_block_library -v
+uv run python -m unittest test_population_diversity -v
 uv run python benchmark_coevolution.py   # ~15 minutes
 ```
 

@@ -31,19 +31,28 @@ Usage::
     uv run python solver_deap_coevolution.py --seed 42
     uv run python solver_deap_coevolution.py --fitness misplaced --seed 42
 
-Importing this module runs no search, prints nothing and creates no plots.
+The CLI also keeps a persistent library of up to 100 distinct move blocks
+(``--block-library PATH``, ``--no-block-library``); see
+persistent_move_block_library_specs.md.
+
+Importing this module runs no search, prints nothing, creates no plots and
+touches no library file.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
+import json
 import math
 import os
 import random
 import signal
 import sys
+import tempfile
 import time
-from collections import Counter, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from functools import lru_cache
 from operator import itemgetter
@@ -60,15 +69,22 @@ from cube import Cube
 
 DEFAULT_FITNESS = "manhattan"
 DEFAULT_SOLUTION_POPULATION = 1000
-DEFAULT_BLOCK_POPULATION = 250
-DEFAULT_SOLUTION_CAPACITY = 32
-DEFAULT_BLOCK_CAPACITY = 16
+DEFAULT_BLOCK_POPULATION = 500
+DEFAULT_SOLUTION_CAPACITY = 64
+DEFAULT_BLOCK_CAPACITY = 24
 DEFAULT_CONTEXT_COUNT = 16
 DEFAULT_GENERATIONS = 10000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
 DEFAULT_LOG_EVERY = 10
 DEFAULT_MANHATTAN_WEIGHT = 1.0
 DEFAULT_MISPLACED_WEIGHT = 1.0
+
+# Solution-population diversity and stagnation checks (solution_population_diversity_specs.md).
+DIVERSITY_CHECK_INTERVAL = 50
+DEFAULT_DIVERSITY_MIN_UNIQUE_RATIO = 0.10
+DEFAULT_DIVERSITY_MAX_DOMINANCE = 0.80
+DEFAULT_DIVERSITY_MIN_CUBIE_DISTANCE = 2.0
+DEFAULT_STAGNATION_GENERATIONS = 100
 
 FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie", "edges",
                    "cubie-refined", "grouped-cubie")
@@ -923,6 +939,24 @@ class SearchCounters:
     block_discoveries_archived: int = 0
     block_fallbacks: Counter = field(default_factory=Counter)
     attributed_improvements: Counter = field(default_factory=Counter)
+    # Persistent block library; all stay zero when the library is disabled.
+    library_seeded_blocks: int = 0
+    library_candidates_submitted: int = 0
+    library_reference_evaluations: int = 0
+    library_reference_cache_hits: int = 0
+    library_additions: int = 0
+    library_equivalent_merges: int = 0
+    library_representative_updates: int = 0
+    library_evictions: int = 0
+    library_rejected_candidates: int = 0
+    library_too_long_candidates: int = 0
+    library_rejected_records: int = 0
+    library_pending_payloads: int = 0
+    library_checkpoints: int = 0
+    library_saves: int = 0
+    library_load_seconds: float = 0.0
+    library_evaluation_seconds: float = 0.0
+    library_write_seconds: float = 0.0
 
 
 class CostCache:
@@ -1082,7 +1116,7 @@ def _block_tournament_key(block):
 _SOLUTION_FIELDS = ("uid", "active", "endpoint", "cost", "solved", "rank", "origin", "operator",
                     "parents", "block_id", "objective_identity", "input_key", "created_generation")
 _BLOCK_FIELDS = ("uid", "active", "origin", "operator", "parents", "fallback_reason",
-                 "target_length", "created_generation")
+                 "target_length", "created_generation", "library_id")
 
 
 def select_context_states(ranked_population, context_count, rng, original_key):
@@ -1157,6 +1191,15 @@ class SearchConfig:
     time_limit: Optional[float] = None
     log_every: int = DEFAULT_LOG_EVERY
     plot: bool = False
+    # Absolute path of the persistent block library, or None to disable it. The CLI
+    # enables it by default; library callers opt in so tests and benchmarks stay isolated.
+    block_library: Optional[str] = None
+    # Diversity/stagnation warnings every 50 completed generations (measurement only).
+    diversity_checks: bool = True
+    diversity_min_unique_ratio: float = DEFAULT_DIVERSITY_MIN_UNIQUE_RATIO
+    diversity_max_dominance: float = DEFAULT_DIVERSITY_MAX_DOMINANCE
+    diversity_min_cubie_distance: float = DEFAULT_DIVERSITY_MIN_CUBIE_DISTANCE
+    stagnation_generations: int = DEFAULT_STAGNATION_GENERATIONS
 
 
 def _require_int(name, value, minimum):
@@ -1187,6 +1230,17 @@ def validate_config(config):
     limit = config.time_limit
     if limit is not None and (not isinstance(limit, (int, float)) or not math.isfinite(limit) or limit <= 0):
         raise ConfigError(f"time limit must be finite and strictly positive, got {limit!r}")
+    library = config.block_library
+    if library is not None and (not isinstance(library, str) or not library):
+        raise ConfigError("block library must be a non-empty path or None")
+    if type(config.diversity_checks) is not bool:
+        raise ConfigError("diversity checks must be True or False")
+    for name, value, upper in (("diversity minimum unique ratio", config.diversity_min_unique_ratio, 1),
+                               ("diversity maximum dominance", config.diversity_max_dominance, 1),
+                               ("diversity minimum cubie distance", config.diversity_min_cubie_distance, 20)):
+        if (type(value) not in (int, float)) or not math.isfinite(value) or not 0 <= value <= upper:
+            raise ConfigError(f"{name} must be a finite number in [0, {upper}], got {value!r}")
+    _require_int("stagnation generations", config.stagnation_generations, 1)
     validate_operator_probabilities()
     return make_objective(config.fitness, config.manhattan_weight, config.misplaced_weight)
 
@@ -1211,6 +1265,9 @@ class RunResult:
     counters: SearchCounters
     history: list
     block_population_created: bool
+    library_report: Optional[dict] = None
+    diversity_records: list = field(default_factory=list)
+    diversity_seconds: float = 0.0
 
 
 @dataclass
@@ -1221,6 +1278,675 @@ class FinalReport:
     cost: Optional[float]
     solved: Optional[bool]
     problems: list
+
+
+# ---------------------------------------------------------------------------
+# Persistent move-block library (persistent_move_block_library_specs.md)
+# ---------------------------------------------------------------------------
+
+BLOCK_LIBRARY_SCHEMA_VERSION = 1
+BLOCK_LIBRARY_EVALUATOR_VERSION = "cubie-refined-v1: 64 * solo cubie distance + misplaced stickers"
+BLOCK_LIBRARY_CAPACITY = 100
+BLOCK_LIBRARY_MAX_MOVES = 64
+BLOCK_LIBRARY_MAX_BYTES = 1 << 20
+BLOCK_LIBRARY_CHECKPOINT_INTERVAL = 50
+BLOCK_LIBRARY_PENDING_LIMIT = 100
+BLOCK_LIBRARY_CACHE_LIMIT = 4096
+BLOCK_LIBRARY_LOCK_TIMEOUT = 2.0
+BLOCK_LIBRARY_FILENAME = "move_blocks_v1.json"
+REFERENCE_PANEL_LENGTHS = (2, 4, 8, 12, 20, 30)
+REFERENCE_PANEL_SAMPLES = 8
+REFERENCE_SOLVED_KEY = "".join(colour * 9 for colour in "GRWOYB")
+_IDENTITY_PERMUTATION = tuple(range(STICKER_COUNT))
+
+
+class BlockLibraryError(Exception):
+    """A library file problem. The solver reports it once, preserves the file and continues."""
+
+    def __init__(self, message, kind="corrupt"):
+        super().__init__(message)
+        self.kind = kind
+
+
+def default_block_library_path():
+    """``$XDG_DATA_HOME/rubik3x3solver/move_blocks_v1.json``, else under ``~/.local/share``."""
+    base = os.environ.get("XDG_DATA_HOME")
+    if not base or not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "rubik3x3solver", BLOCK_LIBRARY_FILENAME)
+
+
+def block_permutation(moves):
+    """Permutation of a move sequence, in the ``_MOVE_TABLES`` convention.
+
+    Applied to the labelled positions 0..53: the sticker at new position ``i``
+    comes from old position ``permutation[i]``.
+    """
+    permutation = _IDENTITY_PERMUTATION
+    for allele in moves:
+        permutation = _MOVE_TABLES[allele](permutation)
+    return permutation
+
+
+def transformation_id(permutation):
+    """SHA-256 of the canonical permutation encoding (one byte per position)."""
+    return hashlib.sha256(bytes(permutation)).hexdigest()
+
+
+def _canonical_digest(value):
+    return hashlib.sha256(json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+
+
+MOVE_CONVENTION_ID = _canonical_digest([[MOVE_NAMES[allele], list(block_permutation((allele,)))]
+                                        for allele in REAL_MOVES])
+
+
+def _panel_allele(length, sample, attempt, position):
+    text = f"rubik-block-library-v1|{length}|{sample}|{attempt}|{position}"
+    return 1 + int.from_bytes(hashlib.sha256(text.encode("ascii")).digest(), "big") % 18
+
+
+@lru_cache(maxsize=1)
+def reference_panel():
+    """The 48 versioned calibration states (8 scrambles at each length), solved and duplicates regenerated."""
+    states, seen = [], set()
+    for length in REFERENCE_PANEL_LENGTHS:
+        for sample in range(REFERENCE_PANEL_SAMPLES):
+            attempt = 0
+            while True:
+                key = REFERENCE_SOLVED_KEY
+                for position in range(length):
+                    key = apply_move_to_key(key, _panel_allele(length, sample, attempt, position))
+                if not is_solved_key(key) and key not in seen:
+                    break
+                attempt += 1
+            seen.add(key)
+            states.append(key)
+    return tuple(states)
+
+
+@lru_cache(maxsize=1)
+def reference_panel_digest():
+    return _canonical_digest(list(reference_panel()))
+
+
+def library_reference_cost(key):
+    """The library's fixed, versioned evaluator, whatever the run's CLI objective."""
+    return 64 * cubie_cost(key) + misplaced_cost(key)
+
+
+@lru_cache(maxsize=1)
+def _reference_baselines():
+    return tuple((key, library_reference_cost(key)) for key in reference_panel())
+
+
+def reference_score(permutation, check=None):
+    """``(solved_count, useful_count, gain_ppm_sum)`` of the complete transformation on the panel.
+
+    ``check`` runs before each panel state, so a budget stop leaves no partial score.
+    """
+    apply = itemgetter(*permutation)
+    solved = useful = gain_ppm = 0
+    for before, before_cost in _reference_baselines():
+        if check is not None:
+            check()
+        after = "".join(apply(before))
+        gain = before_cost - library_reference_cost(after)
+        solved += is_solved_key(after)
+        useful += gain >= 1
+        gain_ppm += (1_000_000 * max(gain, 0)) // before_cost
+    return (solved, useful, gain_ppm)
+
+
+@dataclass(frozen=True)
+class LibraryEntry:
+    permutation: tuple
+    moves: tuple
+    score: tuple
+    transformation_id: str
+
+    def rank_key(self):
+        solved, useful, gain_ppm = self.score
+        return (-solved, -useful, -gain_ppm, len(self.moves), self.moves, self.transformation_id)
+
+    def record(self):
+        solved, useful, gain_ppm = self.score
+        return {
+            "transformation_id": self.transformation_id,
+            "permutation": list(self.permutation),
+            "moves": [MOVE_NAMES[allele] for allele in self.moves],
+            "reference_score": {"solved_count": solved, "useful_count": useful, "gain_ppm_sum": gain_ppm},
+        }
+
+
+def _library_document(entries):
+    records = [entry.record() for entry in entries]
+    return {
+        "schema_version": BLOCK_LIBRARY_SCHEMA_VERSION,
+        "move_convention_id": MOVE_CONVENTION_ID,
+        "evaluator_version": BLOCK_LIBRARY_EVALUATOR_VERSION,
+        "reference_panel_digest": reference_panel_digest(),
+        "revision": _canonical_digest(records),
+        "entries": records,
+    }
+
+
+def _serialise_library(document):
+    """JSON with one compact entry per line; still a single valid JSON object."""
+    head = json.dumps({key: value for key, value in document.items() if key != "entries"}, indent=1)
+    lines = ",\n".join("  " + json.dumps(record, separators=(",", ":")) for record in document["entries"])
+    return f'{head[:-2]},\n "entries": [\n{lines}\n ]\n}}\n'
+
+
+def _reject_json_constant(name):
+    raise BlockLibraryError(f"library contains the non-finite number {name}")
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise BlockLibraryError(f"library repeats the key {key!r}")
+        result[key] = value
+    return result
+
+
+def _read_library_file(path):
+    """Parsed JSON document, or None for a missing file. Never executes stored data."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(BLOCK_LIBRARY_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise BlockLibraryError(f"cannot read the library: {exc.strerror or exc}", "unreadable") from None
+    if len(data) > BLOCK_LIBRARY_MAX_BYTES:
+        raise BlockLibraryError("the library file exceeds 1 MiB")
+    try:
+        return json.loads(data.decode("utf-8"), parse_constant=_reject_json_constant,
+                          object_pairs_hook=_unique_json_object)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise BlockLibraryError(f"the library is not valid UTF-8 JSON ({exc})") from None
+
+
+_LIBRARY_KEYS = {"schema_version", "move_convention_id", "evaluator_version", "reference_panel_digest",
+                 "revision", "entries"}
+_LIBRARY_ENTRY_KEYS = {"transformation_id", "permutation", "moves", "reference_score"}
+_LIBRARY_SCORE_KEYS = ("solved_count", "useful_count", "gain_ppm_sum")
+
+
+def _parse_library_document(document, score):
+    """Validated, rescored entries of a parsed library; raises BlockLibraryError on any defect."""
+    if not isinstance(document, dict) or set(document) != _LIBRARY_KEYS:
+        raise BlockLibraryError("the library has unexpected top-level fields")
+    version = document["schema_version"]
+    if type(version) is not int or version != BLOCK_LIBRARY_SCHEMA_VERSION:
+        raise BlockLibraryError(f"unsupported library schema version {version!r}", "incompatible")
+    if document["move_convention_id"] != MOVE_CONVENTION_ID:
+        raise BlockLibraryError("the library uses a different move convention", "incompatible")
+    if (document["evaluator_version"] != BLOCK_LIBRARY_EVALUATOR_VERSION
+            or document["reference_panel_digest"] != reference_panel_digest()):
+        # Version 1 is the first evaluator/panel, so no older version can be migrated yet.
+        raise BlockLibraryError("the library uses an unknown evaluator or reference panel", "incompatible")
+    records = document["entries"]
+    if not isinstance(records, list) or len(records) > BLOCK_LIBRARY_CAPACITY:
+        raise BlockLibraryError("the library entry list is missing or longer than 100")
+    if document["revision"] != _canonical_digest(records):
+        raise BlockLibraryError("the library revision does not match its entries")
+    entries, seen = [], set()
+    for index, record in enumerate(records):
+        problem = _library_record_problem(record)
+        if problem is None:
+            alleles = tuple(ALLELE_BY_NAME[token] for token in record["moves"])
+            permutation = tuple(record["permutation"])
+            if simplify(alleles) != alleles:
+                problem = "moves are not reduced"
+            elif block_permutation(alleles) != permutation:
+                problem = "permutation does not match a replay of its moves"
+            elif permutation == _IDENTITY_PERMUTATION:
+                problem = "identity transformation"
+            elif transformation_id(permutation) != record["transformation_id"]:
+                problem = "transformation_id does not match its permutation"
+            elif permutation in seen:
+                problem = "duplicate transformation"
+            else:
+                stored = tuple(record["reference_score"][name] for name in _LIBRARY_SCORE_KEYS)
+                recomputed = score(permutation)
+                if stored != recomputed:
+                    problem = "stored reference score differs from the recomputed one"
+                elif recomputed[1] < 1:
+                    problem = "entry is useful on no reference state"
+        if problem is not None:
+            raise BlockLibraryError(f"library entry {index} is invalid: {problem}")
+        seen.add(permutation)
+        entries.append(LibraryEntry(permutation, alleles, recomputed, record["transformation_id"]))
+    return entries
+
+
+def _library_record_problem(record):
+    if not isinstance(record, dict) or set(record) != _LIBRARY_ENTRY_KEYS:
+        return "unexpected fields"
+    identifier = record["transformation_id"]
+    if not isinstance(identifier, str) or len(identifier) != 64 or set(identifier) - set("0123456789abcdef"):
+        return "transformation_id is not a SHA-256 hex digest"
+    permutation = record["permutation"]
+    if (not isinstance(permutation, list) or len(permutation) != STICKER_COUNT
+            or any(type(value) is not int for value in permutation)
+            or sorted(permutation) != list(_IDENTITY_PERMUTATION)):
+        return "permutation is not a bijection of 0..53"
+    moves = record["moves"]
+    if (not isinstance(moves, list) or not 1 <= len(moves) <= BLOCK_LIBRARY_MAX_MOVES
+            or any(not isinstance(token, str) or token == "NOOP" or token not in ALLELE_BY_NAME for token in moves)):
+        return "moves are not 1-64 real move tokens"
+    score = record["reference_score"]
+    if not isinstance(score, dict) or set(score) != set(_LIBRARY_SCORE_KEYS):
+        return "reference_score has unexpected fields"
+    values = [score[name] for name in _LIBRARY_SCORE_KEYS]
+    if any(type(value) is not int or value < 0 for value in values):
+        return "reference_score values are not nonnegative integers"
+    panel_size = len(REFERENCE_PANEL_LENGTHS) * REFERENCE_PANEL_SAMPLES
+    if values[0] > values[1] or values[1] > panel_size or values[2] > panel_size * 1_000_000:
+        return "reference_score values are out of range"
+    return None
+
+
+@contextlib.contextmanager
+def _library_lock(lock_path, timeout):
+    """Exclusive OS advisory lock on a companion file, released when the process exits."""
+    try:
+        import fcntl
+    except ImportError:
+        raise BlockLibraryError("advisory file locking is unavailable on this platform", "lock") from None
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise BlockLibraryError(f"timed out after {timeout:g}s waiting for {lock_path}", "lock") from None
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write(path, text):
+    """Write to a temporary file in the destination directory, fsync, then replace atomically."""
+    data = text.encode("utf-8")
+    if len(data) > BLOCK_LIBRARY_MAX_BYTES:
+        raise BlockLibraryError("the library would exceed 1 MiB", "unwritable")
+    directory = os.path.dirname(path)
+    descriptor, temporary = tempfile.mkstemp(prefix=".move_blocks_", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+    with contextlib.suppress(OSError):
+        directory_descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+
+
+class BlockLibrary:
+    """Bounded archive of the best distinct transformations, synchronised with one JSON file.
+
+    Membership and order come only from the fixed reference panel; runtime block
+    fitness never enters the archive and archive scores never enter DEAP fitness.
+    """
+
+    def __init__(self, path, *, counters=None, report=None, lock_timeout=BLOCK_LIBRARY_LOCK_TIMEOUT):
+        self.path = os.path.abspath(path)
+        self.counters = counters if counters is not None else SearchCounters()
+        self.report = report
+        self.lock_timeout = lock_timeout
+        self.entries = {}
+        self.usable = True
+        self.writable = True
+        self.diagnostics = []
+        self.snapshot_digest = None
+        self.loaded_count = 0
+        self._scores = OrderedDict()
+        self._fingerprints = OrderedDict()
+
+    def _diagnose(self, message):
+        if message not in self.diagnostics:
+            self.diagnostics.append(message)
+            if self.report is not None:
+                self.report(f"Block library: {message}")
+
+    def _score(self, permutation, check=None):
+        key = (BLOCK_LIBRARY_EVALUATOR_VERSION, reference_panel_digest(), MOVE_CONVENTION_ID, permutation)
+        score = self._scores.get(key)
+        if score is not None:
+            self._scores.move_to_end(key)
+            self.counters.library_reference_cache_hits += 1
+            return score
+        if check is not None:
+            check()  # Do not even start an uncached panel evaluation after a stop.
+        score = reference_score(permutation, check)
+        self.counters.library_reference_evaluations += 1
+        self._scores[key] = score
+        if len(self._scores) > BLOCK_LIBRARY_CACHE_LIMIT:
+            self._scores.popitem(last=False)
+        return score
+
+    def fingerprint(self, moves):
+        """``(reduced moves, permutation)`` for a candidate, cached per distinct reduced sequence."""
+        reduced = simplify(moves)
+        permutation = self._fingerprints.get(reduced)
+        if permutation is None:
+            permutation = block_permutation(reduced)
+            self._fingerprints[reduced] = permutation
+            if len(self._fingerprints) > BLOCK_LIBRARY_CACHE_LIMIT:
+                self._fingerprints.popitem(last=False)
+        else:
+            self._fingerprints.move_to_end(reduced)
+        return reduced, permutation
+
+    def ranked(self):
+        return sorted(self.entries.values(), key=LibraryEntry.rank_key)
+
+    def _merge(self, entry, *, count=True):
+        current = self.entries.get(entry.permutation)
+        if current is None:
+            self.entries[entry.permutation] = entry
+            return
+        if count:
+            self.counters.library_equivalent_merges += 1
+        if (len(entry.moves), entry.moves) < (len(current.moves), current.moves):
+            self.entries[entry.permutation] = entry
+            if count:
+                self.counters.library_representative_updates += 1
+
+    def _trim(self):
+        if len(self.entries) > BLOCK_LIBRARY_CAPACITY:
+            self.entries = {entry.permutation: entry for entry in self.ranked()[:BLOCK_LIBRARY_CAPACITY]}
+
+    def submit(self, candidates, check=None):
+        """Reference-evaluate candidate move sequences and keep the eligible best 100.
+
+        Candidates are deduplicated by transformation first. A budget stop raised
+        by ``check`` leaves only fully evaluated candidates in the archive.
+        """
+        if not self.usable:
+            return
+        started = time.monotonic()
+        try:
+            distinct = {}
+            for moves in candidates:
+                self.counters.library_candidates_submitted += 1
+                reduced, permutation = self.fingerprint(moves)
+                if permutation == _IDENTITY_PERMUTATION:
+                    self.counters.library_rejected_candidates += 1
+                    continue
+                if len(reduced) > BLOCK_LIBRARY_MAX_MOVES:
+                    self.counters.library_too_long_candidates += 1
+                    continue
+                current = distinct.get(permutation)
+                if current is None or (len(reduced), reduced) < (len(current), current):
+                    distinct[permutation] = reduced
+            before = set(self.entries)
+            for permutation, reduced in distinct.items():
+                score = self._score(permutation, check)
+                if score[1] < 1:
+                    self.counters.library_rejected_candidates += 1
+                    continue
+                self._merge(LibraryEntry(permutation, reduced, score, transformation_id(permutation)))
+                self._trim()
+            after = set(self.entries)
+            self.counters.library_additions += len(after - before)
+            self.counters.library_evictions += len(before - after)
+        finally:
+            self.counters.library_evaluation_seconds += time.monotonic() - started
+
+    def load(self):
+        """Read and validate one snapshot; on failure the library is unused for this run and the file kept."""
+        started = time.monotonic()
+        try:
+            document = _read_library_file(self.path)
+            entries = [] if document is None else _parse_library_document(document, self._score)
+        except BlockLibraryError as exc:
+            self.usable = self.writable = False
+            self.counters.library_rejected_records += 1
+            self._diagnose(f"{exc} ({self.path}); the file is preserved and the library is unused for this run")
+            return False
+        finally:
+            self.counters.library_load_seconds += time.monotonic() - started
+        self.entries = {entry.permutation: entry for entry in entries}
+        self.loaded_count = len(entries)
+        self.snapshot_digest = _canonical_digest([entry.record() for entry in self.ranked()])
+        return True
+
+    def save(self, check=None):
+        """Merge and atomically replace; defer if uncached validation exceeds the budget.
+
+        Cached, previously verified scores can still be merged after a stop.
+        New entries from another writer must be validated before any replacement;
+        if that needs unavailable search time, leave the entire file untouched.
+        """
+        if not (self.usable and self.writable):
+            return False
+        started = time.monotonic()
+        try:
+            if not self.entries and not os.path.exists(self.path):
+                return False
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with _library_lock(self.path + ".lock", self.lock_timeout):
+                document = _read_library_file(self.path)
+                if document is not None:
+                    for entry in _parse_library_document(document, lambda permutation: self._score(permutation, check)):
+                        self._merge(entry, count=False)
+                    self._trim()
+                updated = _library_document(self.ranked())
+                if document is not None and document["entries"] == updated["entries"]:
+                    return False
+                if not updated["entries"]:
+                    return False
+                _atomic_write(self.path, _serialise_library(updated))
+                self.counters.library_saves += 1
+                return True
+        except SearchStopped as exc:
+            self._diagnose(f"save deferred: reference validation stopped ({exc}); "
+                           f"the file is preserved ({self.path})")
+            return False
+        except BlockLibraryError as exc:
+            if exc.kind in ("corrupt", "incompatible"):
+                self.writable = False
+            self._diagnose(f"{exc} ({self.path}); the file is preserved")
+            return False
+        except OSError as exc:
+            self._diagnose(f"cannot write the library: {exc.strerror or exc} ({self.path}); the file is preserved")
+            return False
+        finally:
+            self.counters.library_write_seconds += time.monotonic() - started
+
+
+# ---------------------------------------------------------------------------
+# Solution-population diversity and stagnation (solution_population_diversity_specs.md)
+# ---------------------------------------------------------------------------
+
+DIVERSITY_CONDITIONS = ("LOW_UNIQUE_STATES", "DOMINANT_STATE", "LOW_CUBIE_SPREAD", "NO_QUALITY_PROGRESS")
+
+
+def decode_cubie_poses(key):
+    """Position and orientation of each of the 20 cubies, relative to the face centres.
+
+    Returns ``(cubie, pose)`` pairs: the cubie is its sorted face-index colours and the
+    pose is ``(slot, colours in slot order)``. Raises ValueError when the stickers do not
+    form a distinct, consistent set of cubies. This is not a proof of solvability.
+    """
+    faces = _face_indices(key)
+    poses, seen = [], set()
+    for slot, (getter, distances) in enumerate(_CUBIE_TABLES):
+        label = "".join(getter(faces))
+        if label not in distances:
+            raise ValueError("the stickers do not form a consistent set of cubies")
+        cubie = "".join(sorted(label))
+        if cubie in seen:
+            raise ValueError("the stickers repeat a cubie")
+        seen.add(cubie)
+        poses.append((cubie, (slot, label)))
+    return tuple(poses)
+
+
+def mean_cubie_difference(multiplicities, poses):
+    """Exact mean over unordered candidate pairs of cubies differing in position or orientation.
+
+    ``multiplicities`` maps endpoint -> candidate count and ``poses`` maps endpoint -> decoded
+    cubies. Counts agreeing pairs per cubie and pose, so the work is O(20 * unique endpoints).
+    Returns ``(mean, distance_sum, pair_count)``; the mean is unavailable (None) below two candidates.
+    """
+    count = sum(multiplicities.values())
+    pair_count = count * (count - 1) // 2
+    if pair_count == 0:
+        return None, 0, 0
+    frequencies = defaultdict(int)
+    for endpoint, multiplicity in multiplicities.items():
+        for cubie, pose in poses[endpoint]:
+            frequencies[(cubie, pose)] += multiplicity
+    agreeing = defaultdict(int)
+    for (cubie, _), frequency in frequencies.items():
+        agreeing[cubie] += frequency * (frequency - 1) // 2
+    distance_sum = sum(pair_count - pairs for pairs in agreeing.values())
+    return distance_sum / pair_count, distance_sum, pair_count
+
+
+def _subset_diversity(multiplicities, poses, decode_error):
+    count = sum(multiplicities.values())
+    metrics = {"count": count, "unique": len(multiplicities), "unique_ratio": None,
+               "dominant": max(multiplicities.values(), default=0), "dominant_ratio": None,
+               "cubie_mean": None, "cubie_reason": None}
+    if count:
+        metrics["unique_ratio"] = metrics["unique"] / count
+        metrics["dominant_ratio"] = metrics["dominant"] / count
+    if decode_error is not None:
+        metrics["cubie_reason"] = decode_error
+    elif count < 2:
+        metrics["cubie_reason"] = "fewer than two candidates"
+    else:
+        metrics["cubie_mean"] = mean_cubie_difference(multiplicities, poses)[0]
+    return metrics
+
+
+def measure_population_diversity(population, expected_size):
+    """Diversity metrics of the published population and of its non-reset part.
+
+    Reads only each candidate's verified endpoint key and current slot; never mutates
+    candidates, replays chromosomes, evaluates costs or uses randomness. Decoded cubies
+    live only for this call.
+    """
+    record = {"available": True, "reason": None, "sizes": None, "whole": None, "non_reset": None}
+    try:
+        endpoints = [(individual.endpoint, individual.slot) for individual in population]
+    except (AttributeError, TypeError):
+        record.update(available=False, reason="population is missing or lacks endpoint/slot metadata")
+        return record
+    if any(not isinstance(endpoint, str) or len(endpoint) != STICKER_COUNT for endpoint, _ in endpoints):
+        record.update(available=False, reason="a candidate has no valid 54-sticker endpoint")
+        return record
+    reset = sum(1 for _, slot in endpoints if slot == "reset")
+    record["sizes"] = {"whole": len(endpoints), "non_reset": len(endpoints) - reset, "reset": reset}
+    if len(endpoints) != expected_size or reset != expected_size // 5:
+        record.update(available=False,
+                      reason=f"population roles are inconsistent: {len(endpoints)} candidates with {reset} "
+                             f"reset slots, expected {expected_size} with {expected_size // 5}")
+        return record
+    whole = Counter(endpoint for endpoint, _ in endpoints)
+    non_reset = Counter(endpoint for endpoint, slot in endpoints if slot != "reset")
+    poses, decode_error = {}, None
+    for endpoint in whole:
+        try:
+            poses[endpoint] = decode_cubie_poses(endpoint)
+        except ValueError as exc:
+            decode_error = f"{exc}, so the cubie spread is unavailable"
+            break
+    record["whole"] = _subset_diversity(whole, poses, decode_error)
+    record["non_reset"] = _subset_diversity(non_reset, poses, decode_error)
+    return record
+
+
+def diversity_conditions(record, generations_without_quality, thresholds):
+    """Active condition IDs with their messages; diversity thresholds use the non-reset subset."""
+    active = []
+    subset = record["non_reset"] if record["available"] else None
+    if subset is not None and subset["count"]:
+        if subset["unique_ratio"] < thresholds["min_unique_ratio"]:
+            active.append(("LOW_UNIQUE_STATES",
+                           f"{subset['unique']}/{subset['count']} non-reset endpoints = "
+                           f"{100 * subset['unique_ratio']:.1f}% (threshold <{100 * thresholds['min_unique_ratio']:.1f}%)"))
+        if subset["dominant_ratio"] > thresholds["max_dominance"]:
+            active.append(("DOMINANT_STATE",
+                           f"{subset['dominant']}/{subset['count']} share one endpoint = "
+                           f"{100 * subset['dominant_ratio']:.2f}% (threshold >{100 * thresholds['max_dominance']:.1f}%)"))
+        if subset["cubie_mean"] is not None and subset["cubie_mean"] < thresholds["min_cubie_distance"]:
+            active.append(("LOW_CUBIE_SPREAD",
+                           f"mean differing cubies = {subset['cubie_mean']:.2f}/20 "
+                           f"(threshold <{thresholds['min_cubie_distance']:g})"))
+    if generations_without_quality >= thresholds["stagnation_generations"]:
+        active.append(("NO_QUALITY_PROGRESS",
+                       f"{generations_without_quality} generations without better cube quality "
+                       f"(threshold >={thresholds['stagnation_generations']})"))
+    return active
+
+
+def _subset_text(metrics, name):
+    unique = f"{metrics['unique']}/{metrics['count']} ({100 * metrics['unique_ratio']:.1f}%) {name}"
+    dominant = f"{metrics['dominant']}/{metrics['count']} ({100 * metrics['dominant_ratio']:.2f}%) {name}"
+    spread = (f"{metrics['cubie_mean']:.2f}/20 {name}" if metrics["cubie_mean"] is not None
+              else f"unavailable {name} ({metrics['cubie_reason']})")
+    return unique, dominant, spread
+
+
+def diversity_report_lines(record, previous_flagged):
+    """Summary, then one grouped warning or a single recovery note. Pure: returns text only."""
+    generation = record["generation"]
+    lines = []
+    sizes = record["sizes"]
+    if sizes is not None:
+        lines.append(f"[gen {generation}] solution-population diversity ({sizes['whole']} candidates: "
+                     f"{sizes['non_reset']} non-reset, {sizes['reset']} reset)")
+    else:
+        lines.append(f"[gen {generation}] solution-population diversity")
+    if record["available"] and record["non_reset"]["count"]:
+        unique_n, dominant_n, spread_n = _subset_text(record["non_reset"], "non-reset")
+        unique_w, dominant_w, spread_w = _subset_text(record["whole"], "whole")
+        lines.append(f"  unique endpoints {unique_n}, {unique_w}; dominant endpoint {dominant_n}, {dominant_w}")
+        lines.append(f"  mean differing cubies {spread_n}, {spread_w}")
+    else:
+        lines.append(f"  diversity metrics unavailable: {record['reason'] or 'no non-reset candidates'}")
+    flags = record["flags"]
+    lines.append(f"  {record['generations_without_quality_improvement']} generations since better cube quality; "
+                 f"flags: {', '.join(flags) if flags else 'none'}")
+    if flags:
+        diversity_flags = [flag for flag in flags if flag != "NO_QUALITY_PROGRESS"]
+        if diversity_flags and "NO_QUALITY_PROGRESS" in flags:
+            kind = "low diversity with stalled cube-quality progress"
+        elif diversity_flags:
+            kind = "low solution-population diversity"
+        else:
+            kind = "no cube-quality progress (a progress warning; the population is not reported as homogeneous)"
+        lines.append(f"[gen {generation}] WARNING: {kind}")
+        lines.extend(f"  {flag}: {message}" for flag, message in record["messages"])
+        if diversity_flags:
+            lines.append(f"  Intentional reset slots excluded from thresholds: {sizes['reset']}/{sizes['whole']}.")
+    elif previous_flagged:
+        lines.append(f"[gen {generation}] Diversity/progress recovered: none of the warning thresholds is "
+                     "currently crossed (this does not guarantee convergence).")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1264,6 +1990,11 @@ class CoevolutionRun:
         self.partial_generation = None
         self.partial_phase = None
         self.last_improvement_generation = 0
+        self.last_quality_improvement_generation = 0
+        self.diversity_records = []
+        self.diversity_seconds = 0.0
+        self._diversity_previous_flagged = False
+        self._diversity_consecutive_flagged = 0
         self.last_block_summary = None
         self.history = tools.Logbook()
 
@@ -1275,6 +2006,25 @@ class CoevolutionRun:
         self.baseline_rank = baseline.rank
         self.archive = ArchiveEntry(baseline.active, baseline.endpoint, baseline.cost,
                                     baseline.solved, None, 0, "empty baseline")
+
+        # Persistent block library: one validated snapshot, read before the search timer
+        # starts and never again during this run. Skipped when no block search is needed.
+        self.library = None
+        self.library_status = "disabled" if config.block_library is None else "not needed"
+        self._library_seeds = []
+        self._library_capacity_compatible = 0
+        self._library_snapshot = None
+        self._library_pending = {}
+        self._library_flush_requested = False
+        if config.block_library is not None and not baseline.solved and config.generations > 0:
+            self.library = BlockLibrary(config.block_library, counters=self.counters, report=self.log)
+            if self.library.load():
+                self.library_status = "enabled"
+                eligible = [entry for entry in self.library.ranked() if len(entry.moves) <= self.block_capacity]
+                self._library_capacity_compatible = len(eligible)
+                self._library_seeds = eligible[:config.block_population // 4]
+            else:
+                self.library_status = "unusable"
 
     # -- identities and records -------------------------------------------------
 
@@ -1326,6 +2076,7 @@ class CoevolutionRun:
         block.slot = origin
         block.evaluation = None
         block.batch_serial = None
+        block.library_id = None
         self._block_info[block.uid] = (origin, operator, len(active))
         return block
 
@@ -1405,15 +2156,26 @@ class CoevolutionRun:
         if is_solved_key(key) != candidate.solved:
             raise ConsistencyError("replayed solved flag differs from the stored flag")
 
-    def offer_to_archive(self, candidate, *, uid, source, block_id=None):
-        """Replace the best-ever entry only on a strictly better, verified rank."""
+    def offer_to_archive(self, candidate, *, uid, source, block_id=None, block_payload=None):
+        """Replace the best-ever entry only on a strictly better, verified rank.
+
+        ``block_payload`` is the exact block sequence applied to produce the candidate;
+        it becomes a pending library candidate when the archive improves.
+        """
         if not candidate.rank < self.archive.rank:
             return False
         self._verify_candidate(candidate)
+        # Cube quality is (unsolved, H) only; a shorter sequence at equal H does not count.
+        quality_improved = ((0 if candidate.solved else 1, candidate.cost)
+                            < (0 if self.archive.solved else 1, self.archive.cost))
         self.archive = ArchiveEntry(candidate.active, candidate.endpoint, candidate.cost,
                                     candidate.solved, uid, self.generation_in_progress, source, block_id)
         self.counters.archive_updates += 1
         self.last_improvement_generation = self.generation_in_progress
+        if quality_improved:
+            self.last_quality_improvement_generation = self.generation_in_progress
+        if block_payload and self.library is not None and self.library.usable:
+            self._library_note_payload(tuple(block_payload), self.archive.rank)
         if self.on_improvement is not None:
             self.on_improvement(self, self.archive)
         if candidate.solved:
@@ -1524,7 +2286,8 @@ class CoevolutionRun:
         if outcome.solved and not candidate.solved:
             raise ConsistencyError("a solving block prefix did not reproduce from the original input")
         source = f"block B{block_uid} prefix {outcome.k} on context {context.context_id}"
-        if self.offer_to_archive(candidate, uid=None, source=source, block_id=block_uid):
+        if self.offer_to_archive(candidate, uid=None, source=source, block_id=block_uid,
+                                 block_payload=sequence[:outcome.k]):
             self.counters.block_discoveries_archived += 1
 
     def _index_blocks(self, blocks, batch):
@@ -1658,7 +2421,7 @@ class CoevolutionRun:
             self.counters.attributed_improvements[block_id] += 1
         operator = "baseline-append-targeted" if targeted else "baseline-append-exploratory"
         child = self.make_solution(candidate, origin="baseline-start", operator=operator, block_id=block_id)
-        self.offer_to_archive(candidate, uid=child.uid, source=operator, block_id=block_id)
+        self.offer_to_archive(candidate, uid=child.uid, source=operator, block_id=block_id, block_payload=payload)
         return child
 
     def _ordinary_offspring(self, pool):
@@ -1667,14 +2430,17 @@ class CoevolutionRun:
         parent_active = parent.active
         parents = (parent.uid,)
         block_id = None
+        applied_block = None
         operator = self._choose_solution_operator()
         if operator == "append-block":
             payload, block_id, targeted = self.choose_append_payload(parent_active, parent.endpoint)
             operator = "append-targeted" if targeted else "append-exploratory"
+            applied_block = payload
             proposal = parent_active + payload
             bound = self.solution_capacity + self.block_capacity
         elif operator == "splice-block":
             block, block_id = self._exploratory_block()
+            applied_block = block
             insert = rng.random() < 0.5
             if insert or not parent_active:
                 operator = "splice-insert"
@@ -1706,6 +2472,7 @@ class CoevolutionRun:
             if not parent_active and not other.active:
                 operator = "crossover-empty-fallback"
                 proposal, block_id = self._exploratory_block()
+                applied_block = proposal
                 bound = self.block_capacity
             else:
                 proposal = op_crossover(parent_active, other.active, rng)
@@ -1719,15 +2486,25 @@ class CoevolutionRun:
             self.counters.attributed_improvements[block_id] += 1
         child = self.make_solution(candidate, origin="offspring", operator=operator,
                                    parents=parents, block_id=block_id)
-        self.offer_to_archive(candidate, uid=child.uid, source=operator, block_id=block_id)
+        self.offer_to_archive(candidate, uid=child.uid, source=operator, block_id=block_id,
+                              block_payload=applied_block)
         return child
 
     # -- block population (section 8) ---------------------------------------------------
 
     def initial_block_population(self):
+        """Library seeds first (rank order, no RNG), then fresh blocks on the usual schedule."""
         counts = {}
-        schedule = reduced_length_schedule(self.config.block_population, self.block_capacity, self.rng)
-        return [self.fresh_block(target, counts, origin="initial") for target in schedule]
+        blocks = []
+        for entry in self._library_seeds:
+            counts[entry.moves] = counts.get(entry.moves, 0) + 1
+            block = self.make_block(entry.moves, origin="library", operator="library")
+            block.library_id = entry.transformation_id
+            blocks.append(block)
+        self.counters.library_seeded_blocks = len(blocks)
+        schedule = reduced_length_schedule(self.config.block_population - len(blocks), self.block_capacity, self.rng)
+        blocks.extend(self.fresh_block(target, counts, origin="initial") for target in schedule)
+        return blocks
 
     def fresh_block(self, target_length, counts, *, origin, reason=None, operator=None, parents=()):
         """Fresh block at a scheduled reduced length, respecting the duplicate cap."""
@@ -1849,6 +2626,9 @@ class CoevolutionRun:
         self.partial_phase = "block evaluation"
         self.evaluate_blocks(self.blocks, batch)
         self._index_blocks(self.blocks, batch)
+        if self.library is not None and self.library.usable:
+            # The last complete block evaluation, taken before survivors are replaced.
+            self._library_snapshot = tuple((block.active, block.evaluation) for block in self._block_representatives)
         summary = self._block_summary(self.blocks, batch)
         self.partial_phase = "solution variation"
         next_population = self.next_solution_population(self.population)
@@ -1884,14 +2664,123 @@ class CoevolutionRun:
             generations = self.config.generations
             for generation in range(1, generations + 1):
                 self.run_generation(generation, build_next_blocks=generation < generations)
-                self._record_history(generation)
+                # Measured on the just-published population, before any library maintenance.
+                diversity = None
+                if self.config.diversity_checks and generation % DIVERSITY_CHECK_INTERVAL == 0:
+                    diversity = self.diversity_checkpoint(generation)
+                self._record_history(generation, diversity=diversity)
+                if self.library is not None and self.library.usable:
+                    scheduled = generation == 1 or generation % BLOCK_LIBRARY_CHECKPOINT_INTERVAL == 0
+                    if scheduled or self._library_flush_requested:
+                        self._library_checkpoint(include_snapshot=scheduled)
                 if generation % self.config.log_every == 0:
                     self.report_progress()
+            self._library_final_candidates()
             return self._result(STATUS_BUDGET_EXHAUSTED, "generation budget exhausted")
         except SolutionFound:
+            self._library_final_candidates()
             return self._result(STATUS_SOLVED, "verified solve found")
         except SearchStopped as stop:
+            # No new reference evaluations after a time limit or SIGINT; completed ones are kept.
             return self._result(stop.status, str(stop) or stop.status)
+
+    # -- persistent block library (persistent_move_block_library_specs.md) ---------------
+
+    def _library_note_payload(self, payload, solution_rank):
+        """Keep at most 100 pending payloads: best resulting solution rank, then shorter, then allele order."""
+        if self.library is None or not self.library.usable:
+            return
+        order = (solution_rank, len(payload), payload)
+        current = self._library_pending.get(payload)
+        if current is None or order < current:
+            self._library_pending[payload] = order
+        if len(self._library_pending) > BLOCK_LIBRARY_PENDING_LIMIT:
+            worst = max(self._library_pending, key=self._library_pending.__getitem__)
+            del self._library_pending[worst]
+        self.counters.library_pending_payloads += 1
+        if len(self._library_pending) >= BLOCK_LIBRARY_PENDING_LIMIT:
+            self._library_flush_requested = True
+
+    def _library_snapshot_candidates(self):
+        """Per distinct block: the full sequence if useful on a context, plus its best feasible useful prefix."""
+        for sequence, evaluation in self._library_snapshot or ():
+            if any(outcome.qualifying and outcome.qualifying[-1].k == len(sequence)
+                   for outcome in evaluation.outcomes):
+                yield sequence
+            best = None
+            for outcome in evaluation.outcomes:
+                prefix = outcome.best
+                if prefix is None:
+                    continue
+                order = (_prefix_preference(prefix.solved, prefix.gain, prefix.representative_length, prefix.k),
+                         outcome.context_id)
+                if best is None or order < best[0]:
+                    best = (order, prefix.k)
+            if best is not None:
+                yield sequence[:best[1]]
+
+    def _drain_library_pending(self):
+        payloads = sorted(self._library_pending, key=self._library_pending.__getitem__)
+        self._library_pending = {}
+        self._library_flush_requested = False
+        return payloads
+
+    def _library_checkpoint(self, include_snapshot):
+        """Reference-evaluate this checkpoint's candidates (inside the search budget), then merge-save."""
+        if self.library is None or not self.library.usable:
+            return
+        candidates = list(self._library_snapshot_candidates()) if include_snapshot else []
+        candidates.extend(self._drain_library_pending())
+        self.library.submit(candidates, check=self.budget.check)
+        self.library.save(check=self.budget.check)
+        self.counters.library_checkpoints += 1
+        self.log(f"Block library checkpoint (generation {self.completed_generation}): "
+                 f"{len(self.library.entries)} entries, {self.counters.library_additions} added, "
+                 f"{self.counters.library_equivalent_merges} equivalent merges, "
+                 f"{self.counters.library_evictions} evicted")
+
+    def _library_final_candidates(self):
+        """Bounded final batch after a normal finish or a solve; stops at the budget without partial scores."""
+        if self.library is None or not self.library.usable:
+            return
+        candidates = list(self._library_snapshot_candidates()) + self._drain_library_pending()
+        try:
+            self.library.submit(candidates, check=self.budget.check)
+        except SearchStopped:
+            pass
+
+    def finish_block_library(self, allow_save=True):
+        """Merge-save the completed archive (timed separately from the search) and return a report."""
+        if self.library is None:
+            return {"status": self.library_status, "path": self.config.block_library}
+        if allow_save:
+            self.library.save(check=self.budget.check)
+        return self.library_report()
+
+    def library_report(self):
+        counters = self.counters
+        library = self.library
+        return {
+            "status": self.library_status,
+            "path": self.config.block_library,
+            "entries": len(library.entries) if library is not None else 0,
+            "loaded": library.loaded_count if library is not None else 0,
+            "capacity_compatible": self._library_capacity_compatible,
+            "seeded": [entry.transformation_id for entry in self._library_seeds],
+            "snapshot": library.snapshot_digest if library is not None else None,
+            "diagnostics": list(library.diagnostics) if library is not None else [],
+            "additions": counters.library_additions,
+            "equivalent_merges": counters.library_equivalent_merges,
+            "representative_updates": counters.library_representative_updates,
+            "evictions": counters.library_evictions,
+            "rejected_candidates": counters.library_rejected_candidates + counters.library_too_long_candidates,
+            "rejected_records": counters.library_rejected_records,
+            "reference_evaluations": counters.library_reference_evaluations,
+            "reference_cache_hits": counters.library_reference_cache_hits,
+            "load_seconds": counters.library_load_seconds,
+            "evaluation_seconds": counters.library_evaluation_seconds,
+            "write_seconds": counters.library_write_seconds,
+        }
 
     def interrupted_result(self):
         """Result for a hard interrupt (second SIGINT) that escaped the budget checks."""
@@ -1919,6 +2808,8 @@ class CoevolutionRun:
             counters=self.counters,
             history=list(self.history),
             block_population_created=self.blocks is not None,
+            diversity_records=list(self.diversity_records),
+            diversity_seconds=self.diversity_seconds,
         )
 
     # -- reporting (section 11) ----------------------------------------------------------
@@ -1937,7 +2828,7 @@ class CoevolutionRun:
             "lengths": Counter(len(block.active) for block in blocks),
         }
 
-    def _record_history(self, generation, partial=False):
+    def _record_history(self, generation, partial=False, diversity=None):
         summary = self.last_block_summary
         self.history.record(
             gen=generation,
@@ -1948,6 +2839,41 @@ class CoevolutionRun:
             block_mean_gain=None if summary is None or partial else summary["best_mean_gain"],
             batch=None if summary is None or partial else summary["batch"],
         )
+        if diversity is not None:
+            # Set after recording: Logbook.record() would file a dict argument away as a chapter.
+            # Only checkpoint rows carry a record; other rows never repeat an old one.
+            self.history[-1]["diversity"] = diversity
+
+    def diversity_checkpoint(self, generation):
+        """Measure the published solution population, log the summary/warnings and return the record.
+
+        Measurement only: no RNG use, no cost evaluation, no change to any candidate. The work is
+        bounded and counts toward the search budget, so it completes once started.
+        """
+        started = time.monotonic()
+        config = self.config
+        record = measure_population_diversity(self.population, config.solution_population)
+        record["generation"] = generation
+        record["generations_without_quality_improvement"] = generation - self.last_quality_improvement_generation
+        record["thresholds"] = {
+            "min_unique_ratio": config.diversity_min_unique_ratio,
+            "max_dominance": config.diversity_max_dominance,
+            "min_cubie_distance": config.diversity_min_cubie_distance,
+            "stagnation_generations": config.stagnation_generations,
+        }
+        active = diversity_conditions(record, record["generations_without_quality_improvement"],
+                                      record["thresholds"])
+        record["flags"] = [flag for flag, _ in active]
+        record["messages"] = active
+        self._diversity_consecutive_flagged = self._diversity_consecutive_flagged + 1 if active else 0
+        record["consecutive_flagged"] = self._diversity_consecutive_flagged
+        record["seconds"] = time.monotonic() - started
+        self.diversity_seconds += record["seconds"]
+        self.diversity_records.append(record)
+        for line in diversity_report_lines(record, self._diversity_previous_flagged):
+            self.log(line)
+        self._diversity_previous_flagged = bool(active)
+        return record
 
     def _report_marker(self):
         return (self.completed_generation, self.partial_generation, self.archive.rank)
@@ -2057,7 +2983,11 @@ def run_search(config, input_cube=None, *, budget=None, log=None):
     input_key = validate_input_cube(cube)
     seed = config.seed if config.seed is not None else generate_seed()
     run = CoevolutionRun(config, input_key, objective, seed, budget=budget, log=log)
-    return run.run()
+    result = run.run()
+    if config.block_library is not None:
+        # Persist only after the archived result survives independent replay.
+        result.library_report = run.finish_block_library(allow_save=finalize_result(result).status != STATUS_ERROR)
+    return result
 
 
 def finalize_result(result):
@@ -2156,6 +3086,29 @@ def build_arg_parser():
                         help="optional wall-clock search budget in seconds")
     parser.add_argument("--log-every", type=int, default=DEFAULT_LOG_EVERY)
     parser.add_argument("--plot", action="store_true", help=f"save {PLOT_FILENAME} (off by default)")
+    library = parser.add_mutually_exclusive_group()
+    library.add_argument("--block-library", metavar="PATH", default=None,
+                         help="override the shared move-block library file (default: "
+                              "$XDG_DATA_HOME/rubik3x3solver/move_blocks_v1.json, else ~/.local/share/...)")
+    library.add_argument("--no-block-library", action="store_true",
+                         help="disable all library reads, writes, reference scoring and population seeding")
+    diversity = parser.add_argument_group(
+        "solution-population diversity checks",
+        f"Measured every {DIVERSITY_CHECK_INTERVAL} completed generations; warnings only, the search is unchanged. "
+        "The three diversity thresholds use the non-reset candidates (elites and offspring); the current 20% "
+        "reset slots are excluded. Low diversity is reported separately from stalled cube-quality progress.")
+    diversity.add_argument("--diversity-min-unique-ratio", type=float, default=DEFAULT_DIVERSITY_MIN_UNIQUE_RATIO,
+                           help="warn when unique endpoints / candidates is below this (default 0.10)")
+    diversity.add_argument("--diversity-max-dominance", type=float, default=DEFAULT_DIVERSITY_MAX_DOMINANCE,
+                           help="warn when the most common endpoint's share is above this (default 0.80)")
+    diversity.add_argument("--diversity-min-cubie-distance", type=float,
+                           default=DEFAULT_DIVERSITY_MIN_CUBIE_DISTANCE,
+                           help="warn when the mean number of differing cubies between candidates (0-20) "
+                                "is below this (default 2.0)")
+    diversity.add_argument("--stagnation-generations", type=int, default=DEFAULT_STAGNATION_GENERATIONS,
+                           help="warn after this many generations without better (unsolved, H) (default 100)")
+    diversity.add_argument("--no-diversity-checks", action="store_true",
+                           help="disable diversity measurements and warnings")
     return parser
 
 
@@ -2175,7 +3128,22 @@ def config_from_args(args):
         time_limit=args.time_limit,
         log_every=args.log_every,
         plot=args.plot,
+        block_library=_resolve_block_library(args),
+        diversity_checks=not args.no_diversity_checks,
+        diversity_min_unique_ratio=args.diversity_min_unique_ratio,
+        diversity_max_dominance=args.diversity_max_dominance,
+        diversity_min_cubie_distance=args.diversity_min_cubie_distance,
+        stagnation_generations=args.stagnation_generations,
     )
+
+
+def _resolve_block_library(args):
+    """None when disabled; a user path relative to the working directory; else the shared default."""
+    if args.no_block_library:
+        return None
+    if args.block_library is not None:
+        return os.path.abspath(os.path.expanduser(args.block_library))
+    return default_block_library_path()
 
 
 def _print_status(status, detail=None):
@@ -2212,6 +3180,13 @@ def _print_startup(config, objective, seed, seed_generated, input_cube):
     print("Solution operators: " + ", ".join(f"{name}={probability:.2f}"
                                                for name, probability in SOLUTION_OPERATOR_PROBABILITIES))
     print("Block operators: " + ", ".join(BLOCK_OPERATORS) + " (uniform)")
+    if config.diversity_checks:
+        print(f"Diversity checks: every {DIVERSITY_CHECK_INTERVAL} completed generations on non-reset candidates; "
+              f"warn if unique endpoints <{100 * config.diversity_min_unique_ratio:g}%, one endpoint "
+              f">{100 * config.diversity_max_dominance:g}%, mean differing cubies <{config.diversity_min_cubie_distance:g}, "
+              f"or >={config.stagnation_generations} generations without better cube quality")
+    else:
+        print("Diversity checks: disabled")
 
 
 def _print_final(result, final, finalization_seconds):
@@ -2232,6 +3207,13 @@ def _print_final(result, final, finalization_seconds):
           f"quarter turns={counters.quarter_turns} clones={counters.cube_clones} "
           f"normalisations={counters.normalizations} replays={counters.independent_replays}")
     print(f"Best verified attempt found in generation {entry.generation} via {entry.source}")
+    for line in _library_summary_lines(result.library_report):
+        print(line)
+    if result.diversity_records:  # identifies the last check without replaying its warning
+        flagged = sum(1 for record in result.diversity_records if record["flags"])
+        print(f"Diversity checks: {len(result.diversity_records)} (last at generation "
+              f"{result.diversity_records[-1]['generation']}; {flagged} flagged); "
+              f"diagnostic time {result.diversity_seconds:.3f}s")
     if final.problems:
         for problem in final.problems:
             print(f"CONSISTENCY ERROR: {problem}")
@@ -2241,6 +3223,36 @@ def _print_final(result, final, finalization_seconds):
         print("Final cube:")
         _print_cube(final.cube)
         final.cube.print_as_python_list()
+
+
+def _library_startup_lines(run):
+    report = run.library_report() if run.library is not None else None
+    if run.library_status == "disabled":
+        return ["Block library: disabled"]
+    if run.library_status == "not needed":
+        return [f"Block library: {run.config.block_library} (no block search was needed; not read or written)"]
+    if run.library_status == "unusable":
+        return [f"Block library: {run.config.block_library} (unusable this run; see the message above)"]
+    seeded = ", ".join(identifier[:12] for identifier in report["seeded"]) or "none"
+    return [f"Block library: {report['path']} (enabled)",
+            f"    valid entries {report['loaded']}, fit block capacity {report['capacity_compatible']}, "
+            f"seeded {len(report['seeded'])}, snapshot {report['snapshot'][:16]}, "
+            f"load and rescore {report['load_seconds']:.2f}s",
+            f"    seeded transformations: {seeded}"]
+
+
+def _library_summary_lines(report):
+    if not report or report["status"] in ("disabled", "not needed"):
+        return []
+    lines = [f"Block library: {report['path']} ({report['status']}): {report['entries']} entries; "
+             f"{report['additions']} added, {report['equivalent_merges']} equivalent merges, "
+             f"{report['representative_updates']} shorter representatives, {report['evictions']} evicted, "
+             f"{report['rejected_candidates']} rejected candidates, {report['rejected_records']} rejected records",
+             f"    reference evaluations {report['reference_evaluations']} (cache hits "
+             f"{report['reference_cache_hits']}); load {report['load_seconds']:.2f}s, evaluation "
+             f"{report['evaluation_seconds']:.2f}s, write {report['write_seconds']:.3f}s"]
+    lines.extend(f"    {message}" for message in report["diagnostics"])
+    return lines
 
 
 def _print_improvement(run, entry):
@@ -2310,8 +3322,11 @@ def main(argv=None, *, clock=None):
     budget = Budget(config.time_limit, clock or time.monotonic)
     previous_handler = _install_sigint(budget)
     run = None
+    forced_stop = False
     try:
         run = CoevolutionRun(config, input_key, objective, seed, budget=budget, on_improvement=_print_improvement)
+        for line in _library_startup_lines(run):
+            print(line)
         print(f"Baseline: H={run.baseline.cost} solved={'yes' if run.baseline.solved else 'no'} (0 moves)")
         result = run.run()
         run.report_progress_if_stale()
@@ -2319,6 +3334,7 @@ def main(argv=None, *, clock=None):
         if run is None:
             _print_status(STATUS_INTERRUPTED)
             return EXIT_CODES[STATUS_INTERRUPTED]
+        forced_stop = True
         result = run.interrupted_result()
     except (ConsistencyError, NumericalError) as exc:
         _print_status(STATUS_ERROR, f"Internal error: {exc}")
@@ -2330,6 +3346,8 @@ def main(argv=None, *, clock=None):
     finalization_started = time.monotonic()
     final = finalize_result(result)
     finalization_seconds = time.monotonic() - finalization_started
+    # A forced stop keeps only the last checkpoint; a failed replay persists nothing new.
+    result.library_report = run.finish_block_library(allow_save=not forced_stop and final.status != STATUS_ERROR)
     _print_final(result, final, finalization_seconds)
     if config.plot:
         print(f"Progress plot saved to {save_progress_plot(result.history)}")
