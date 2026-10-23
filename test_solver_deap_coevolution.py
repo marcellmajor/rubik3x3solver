@@ -25,6 +25,8 @@ import solver_deap_coevolution as s
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 SOLVED_KEY = "G" * 9 + "R" * 9 + "W" * 9 + "O" * 9 + "Y" * 9 + "B" * 9
 LABELED_KEY = (string.ascii_letters + "01")[:54]
+# The spec's active checkpoint from solver_deap.py (section 3.1), independent of the module default.
+CHECKPOINT_KEY = "GGGWGGGOG" + "RWRRRGRRR" + "WRWRWWWWW" + "OGOOOOOOO" + "YYYYYYYYY" + "BBBBBBBBB"
 
 
 def key_after(start_key, moves):
@@ -242,7 +244,8 @@ class ObjectiveTests(unittest.TestCase):
         for _ in range(200):
             key = key_after(SOLVED_KEY, s.generate_reduced_block(rng.randint(1, 16), rng))
             self.assertEqual(s.manhattan_cost(key), self.reference_manhattan(key))
-        self.assertEqual(s.manhattan_cost(s.validate_input_cube(s.default_input_cube())), 24)
+        self.assertEqual(s.manhattan_cost(CHECKPOINT_KEY), 24)
+        self.assertEqual(s.manhattan_cost(CHECKPOINT_KEY), self.reference_manhattan(CHECKPOINT_KEY))
 
     def test_every_objective_identifies_the_solved_state(self):
         objectives = [s.make_objective(name) for name in ("manhattan", "misplaced", "manhattan-min", "cubie")]
@@ -448,7 +451,8 @@ class PopulationPolicyTests(unittest.TestCase):
         self.assertEqual(s.op_insert_block((), (7,), rng), (7,))
 
     def test_empty_and_one_move_parents_generate_active_offspring(self):
-        run = make_run(scrambled("R1 U1 C1"), solution_population=10)
+        # A small block population keeps generation-1 blocks from solving this 3-move scramble outright.
+        run = make_run(scrambled("R1 U1 C1"), solution_population=10, block_population=100)
         run.population = run.initial_solution_population()
         run.blocks = run.initial_block_population()
         batch = run.build_context_batch(run.population)

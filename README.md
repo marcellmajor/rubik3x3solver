@@ -169,24 +169,32 @@ Moves use the same `R L U D C B` letters with counts `1..3`, plus `NOOP`. A
 shared simplifier merges same-face turns and commutes opposite faces (`R`/`L`,
 `U`/`D`, `C`/`B`), so reported lengths are reduced, not globally minimal.
 `--fitness` picks `H`: `manhattan` (default, the heuristic above as a pure
-function), `misplaced`, or the weighted `manhattan-misplaced`. Solved means
-every sticker matches its face centre, whatever `H` is in use, and every
-reported result is replayed from the original cube before it counts.
+function), `misplaced`, the weighted `manhattan-misplaced`, or `cubie`: the sum
+over the 20 corner and edge cubies of the moves each would need on its own to
+reach its home slot and orientation. `cubie` rejects an input whose stickers
+do not form a consistent set of cubies. Solved means every sticker matches its
+face centre, whatever `H` is in use, and every reported result is replayed
+from the original cube before it counts.
 
 Unlike the older scripts it has a `main()` guard and no import side effects.
-The input is still hardcoded: `default_input_cube()` is the active checkpoint
-from `solver_deap.py`. Other cubes can go through the library call
-`run_search(SearchConfig(...), cube)`. Main options: `--seed`,
-`--time-limit`, `--generations`, the population, capacity and context sizes,
-and `--plot` (saves `coevolution_progress.png` without opening a window).
-Exit codes: `0` verified solve, `1` budget exhausted, `2` invalid input, `3`
-internal or replay error, `130` interrupted.
+The input is still hardcoded: `default_input_cube()` is a fully scrambled cube
+(`H` = 198 under `manhattan`, cubie cost 32). Other cubes can go through the
+library call `run_search(SearchConfig(...), cube)`. Defaults: 2000 solutions,
+1000 blocks, 5000 generations, solution capacity 32, block capacity 16 and 16
+contexts. Main options: `--seed`, `--fitness`, `--time-limit`,
+`--generations`, the population, capacity and context sizes, and `--plot`
+(saves `coevolution_progress.png` without opening a window). Exit codes: `0`
+verified solve, `1` budget exhausted, `2` invalid input, `3` internal or
+replay error, `130` interrupted.
 
 ## Benchmark ([benchmark_coevolution.py](benchmark_coevolution.py))
 
-Runs both DEAP solvers on the active checkpoint for seeds 42, 43 and 44, with
-120 s, solution capacity 32 and population 200 per run, serially in fresh
-subprocesses. `solver_deap.py` is read from disk and changed in memory only
+Runs both DEAP solvers on the active checkpoint from `solver_deap.py` for
+seeds 42, 43 and 44, with 120 s, solution capacity 32 and population 200 per
+run, serially in fresh subprocesses. The benchmark keeps its own copy of that
+cube and of the spec's original block settings (100 blocks, capacity 16, 16
+contexts), so it does not follow the coevolution solver's defaults.
+`solver_deap.py` is read from disk and changed in memory only
 (seed, `MAX_GENES`, `POPULATION_SIZE`, generation ceiling, no final plot),
 plus read-only hooks that enforce the time limit and record its best prefix.
 The report goes to `experiment_coevolution.txt`, numbered if that file exists.
@@ -223,10 +231,11 @@ script you run, keeping exactly nine stickers of each colour —
 
 - `solver.py` and `solver_deap.py` use hardcoded inputs and parameters, with
   no arguments or tests. The coevolution solver has a CLI and tests but still
-  starts from the hardcoded checkpoint. Dependencies are installed with uv.
+  starts from a hardcoded input cube. Dependencies are installed with uv.
 - The coevolution solver solves short scrambles (up to about 6 moves in
   testing) but did not get past the active checkpoint's plateau in the
-  benchmark.
+  benchmark. On the scrambled default it typically reaches `H` 60–80 within
+  30 generations and then stalls; none of those test runs solved it.
 - Fitness is a heuristic, not an admissible bound: search can stall at local
   optima and solutions are neither guaranteed nor minimal.
 - Exhaustive modes materialise every combination in memory/on disk and do

@@ -320,7 +320,11 @@ def replay_key(start_key, sequence, counters=None):
 
 
 def default_input_cube():
-    """The active checkpoint from ``solver_deap.py`` (its last ``my_cube`` assignment)."""
+    """A fully scrambled default input (manhattan H=198, cubie cost 32).
+
+    The spec's original checkpoint from ``solver_deap.py`` is kept in
+    ``benchmark_coevolution.CHECKPOINT_KEY``.
+    """
     return Cube(
                                    "WYRYGRGRY",
         ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"],

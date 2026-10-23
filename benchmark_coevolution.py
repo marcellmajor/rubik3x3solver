@@ -2,8 +2,12 @@
 
 Each run executes serially in its own subprocess with the same budget:
 
-* new solver: ``solver_deap_coevolution`` with its block defaults, solution
-  capacity 32, population 200, objective ``manhattan`` and a time limit;
+* new solver: ``solver_deap_coevolution`` with the spec's v1 block settings
+  (100 blocks, capacity 16, 16 contexts, gain 1.0), solution capacity 32,
+  population 200, objective ``manhattan`` and a time limit;
+
+Both runs start from the benchmark's own copy of the spec's checkpoint cube,
+whatever the solver module's default input is.
 * baseline: ``solver_deap.py`` read from disk, compiled in memory with AST
   overrides (seed, MAX_GENES=32, POPULATION_SIZE=200, generation ceiling,
   headless) plus read-only instrumentation. Its source is never written and it
@@ -47,6 +51,10 @@ DEFAULT_SEEDS = (42, 43, 44)
 DEFAULT_SECONDS = 120.0
 SOLUTION_CAPACITY = 32
 SOLUTION_POPULATION = 200
+# The protocol's own input and block settings, independent of the solver module's defaults:
+# the spec's active checkpoint (section 3.1, the last my_cube in solver_deap.py) and its v1 block defaults.
+CHECKPOINT_KEY = "GGGWGGGOG" + "RWRRRGRRR" + "WRWRWWWWW" + "OGOOOOOOO" + "YYYYYYYYY" + "BBBBBBBBB"
+SPEC_BLOCK_SETTINGS = {"block_population": 100, "block_capacity": 16, "contexts": 16, "min_block_gain": 1.0}
 GENERATION_CEILING = 1_000_000
 NEUTRALITY_GENERATIONS = 5
 REPORT_FILENAME = "experiment_coevolution.txt"
@@ -280,8 +288,8 @@ def run_old_worker(seed, seconds, generation_ceiling, log_path, observe=True):
         with contextlib.redirect_stdout(log):
             exec(compile(setup_module, OLD_SOLVER_PATH, "exec"), namespace)
         input_key = s.state_key(namespace["my_cube"])
-        if input_key != s.validate_input_cube(s.default_input_cube()):
-            raise RuntimeError("solver_deap.py's active my_cube differs from the specified input literal")
+        if input_key != s.validate_input_cube(s.cube_from_key(CHECKPOINT_KEY)):
+            raise RuntimeError("solver_deap.py's active my_cube differs from the spec's checkpoint cube")
         config = s.SearchConfig(seed=seed, solution_population=SOLUTION_POPULATION,
                                 solution_capacity=SOLUTION_CAPACITY, generations=0)
         observer = s.CoevolutionRun(config, input_key, s.make_objective("manhattan"), seed, log=lambda message: None)
@@ -382,9 +390,9 @@ def run_new_worker(seed, seconds, generation_ceiling, log_path):
 
     config = s.SearchConfig(fitness="manhattan", seed=seed, solution_population=SOLUTION_POPULATION,
                             solution_capacity=SOLUTION_CAPACITY, generations=generation_ceiling,
-                            time_limit=seconds, log_every=100)
+                            time_limit=seconds, log_every=100, **SPEC_BLOCK_SETTINGS)
     objective = s.validate_config(config)
-    input_key = s.validate_input_cube(s.default_input_cube())
+    input_key = s.validate_input_cube(s.cube_from_key(CHECKPOINT_KEY))
     budget = s.Budget(seconds)
     with open(log_path or os.devnull, "w") as log:
         run = s.CoevolutionRun(config, input_key, objective, seed, budget=budget,
