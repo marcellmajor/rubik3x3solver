@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from operator import itemgetter
 from typing import Optional
 
+import colorama
 from deap import base, creator, tools
 
 from cube import Cube
@@ -53,8 +54,8 @@ from cube import Cube
 # ---------------------------------------------------------------------------
 
 DEFAULT_FITNESS = "manhattan"
-DEFAULT_SOLUTION_POPULATION = 2000
-DEFAULT_BLOCK_POPULATION = 1000
+DEFAULT_SOLUTION_POPULATION = 300
+DEFAULT_BLOCK_POPULATION = 120
 DEFAULT_SOLUTION_CAPACITY = 32
 DEFAULT_BLOCK_CAPACITY = 16
 DEFAULT_CONTEXT_COUNT = 16
@@ -1151,13 +1152,15 @@ class FinalReport:
 class CoevolutionRun:
     """One reproducible run: owns its RNG, counters, archive and both populations."""
 
-    def __init__(self, config, input_key, objective, seed, *, budget=None, log=None):
+    def __init__(self, config, input_key, objective, seed, *, budget=None, log=None, on_improvement=None):
         self.config = config
         self.objective = objective
         self.seed = seed
         self.rng = random.Random(seed)
         self.budget = budget if budget is not None else Budget(config.time_limit)
         self.log = log if log is not None else _print_flush
+        # Called as on_improvement(run, entry) after every verified new best-ever entry.
+        self.on_improvement = on_improvement
         self.counters = SearchCounters()
         self.cost = CostCache(objective, self.counters)
         self.input_key = input_key
@@ -1332,6 +1335,8 @@ class CoevolutionRun:
                                     candidate.solved, uid, self.generation_in_progress, source, block_id)
         self.counters.archive_updates += 1
         self.last_improvement_generation = self.generation_in_progress
+        if self.on_improvement is not None:
+            self.on_improvement(self, self.archive)
         if candidate.solved:
             raise SolutionFound(self.archive)
         return True
@@ -1928,6 +1933,28 @@ class CoevolutionRun:
             parts.append(f"B{block_id}({origin}/{operator}, len {length})={count}")
         return ", ".join(parts)
 
+    def top_blocks(self, count=2):
+        """Best distinct block sequences already scored on the current batch, and how many were scored."""
+        if self.batch is None or not self.blocks:
+            return [], 0
+        scored = [block for block in self.blocks
+                  if block.evaluation is not None and block.batch_serial == self.batch.serial]
+        top, seen = [], set()
+        for block in sorted(scored, key=_block_sort_key):
+            if block.active not in seen:
+                seen.add(block.active)
+                top.append(block)
+                if len(top) == count:
+                    break
+        return top, len(scored)
+
+    def find_block(self, uid):
+        """The block with this ID in the current block population, or None."""
+        for block in self.blocks or ():
+            if block.uid == uid:
+                return block
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Library entry points, finalisation and plotting
@@ -1936,6 +1963,12 @@ class CoevolutionRun:
 
 def _print_flush(message=""):
     print(message, flush=True)
+
+
+def _print_cube(cube):
+    """Coloured net via cube.py, then undo the stream wrapping its colorama.init() adds on every call."""
+    cube.print_colored()
+    colorama.deinit()
 
 
 def run_search(config, input_cube=None, *, budget=None, log=None):
@@ -2078,7 +2111,7 @@ def _print_startup(config, objective, seed, seed_generated, input_cube):
     offspring = 3 * solution_fifth
     print("Cooperative coevolution solver: solution candidates + move blocks (DEAP)")
     print("Original cube:")
-    input_cube.print_colored()
+    _print_cube(input_cube)
     input_cube.print_as_python_list()
     print(f"Objective: {objective.describe()}")
     if objective.state_function == "manhattan-misplaced":
@@ -2127,8 +2160,39 @@ def _print_final(result, final, finalization_seconds):
     if final.cube is not None:
         print(f"Replayed cost H={final.cost} solved={'yes' if final.solved else 'no'}")
         print("Final cube:")
-        final.cube.print_colored()
+        _print_cube(final.cube)
         final.cube.print_as_python_list()
+
+
+def _print_improvement(run, entry):
+    """New best-ever state as a coloured cube, plus the two best-ranked move blocks right now."""
+    print()
+    print(f">>> New best state in generation {entry.generation} ({run.budget.elapsed():.1f}s): H={entry.cost}, "
+          f"{len(entry.active)} moves, found via {entry.source}")
+    print(f"    moves: {format_moves(entry.active)}")
+    source_block = run.find_block(entry.block_id) if entry.block_id is not None else None
+    if source_block is not None:
+        print(f"    block B{source_block.uid}: {format_moves(source_block.active)}")
+    if entry.solved:
+        print("    solved; the cube is printed in the final report below")
+    else:
+        _print_cube(cube_from_key(entry.endpoint))
+    top, scored = run.top_blocks(2)
+    if not top:
+        print("    top move blocks: none scored on this generation's contexts yet")
+    else:
+        progress = "all" if scored == len(run.blocks) else f"{scored} of {len(run.blocks)}"
+        print(f"    top move blocks on batch #{run.batch.serial} ({progress} blocks scored, "
+              f"{len(run.batch.contexts)} contexts):")
+        for rank, block in enumerate(top, 1):
+            evaluation = block.evaluation
+            best_gain = max((outcome.best.gain for outcome in evaluation.outcomes if outcome.best), default=0)
+            print(f"    #{rank} B{block.uid} ({block.origin}/{block.operator}, {len(block.active)} moves): "
+                  f"{format_moves(block.active)}")
+            print(f"        lowers H by up to {best_gain}, useful on {evaluation.useful_contexts}/"
+                  f"{len(evaluation.outcomes)} contexts, mean relative gain {evaluation.mean_relative_gain:.4f}, "
+                  f"credited improvements {run.counters.attributed_improvements.get(block.uid, 0)}")
+    sys.stdout.flush()
 
 
 def _install_sigint(budget):
@@ -2168,7 +2232,7 @@ def main(argv=None, *, clock=None):
     previous_handler = _install_sigint(budget)
     run = None
     try:
-        run = CoevolutionRun(config, input_key, objective, seed, budget=budget)
+        run = CoevolutionRun(config, input_key, objective, seed, budget=budget, on_improvement=_print_improvement)
         print(f"Baseline: H={run.baseline.cost} solved={'yes' if run.baseline.solved else 'no'} (0 moves)")
         result = run.run()
         run.report_progress_if_stale()

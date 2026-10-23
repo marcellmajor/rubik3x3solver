@@ -857,6 +857,46 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(final.status, s.STATUS_SOLVED)
                 self.assertTrue(s.is_solved_key(key_after(result.input_key, final.moves)))
 
+    def test_improvement_callback_fires_only_on_strictly_better_entries(self):
+        seen = []
+        config = s.SearchConfig(seed=1, solution_population=10, block_population=10)
+        cube = scrambled("R1 U1 C1")
+        run = s.CoevolutionRun(config, s.validate_input_cube(cube), s.validate_config(config), 1,
+                               log=lambda message: None, on_improvement=lambda run, entry: seen.append(entry))
+        better = run.normalize_solution(s.parse_moves("C3"))
+        self.assertTrue(run.offer_to_archive(better, uid=None, source="test"))
+        self.assertFalse(run.offer_to_archive(better, uid=None, source="test"))
+        self.assertEqual([entry.active for entry in seen], [s.parse_moves("C3")])
+        self.assertIs(seen[0], run.archive)
+
+    def test_top_blocks_rank_distinct_sequences_on_the_current_batch(self):
+        run = make_run(scrambled("R1 U1 C1"), solution_population=5, block_population=10, contexts=1)
+        self.assertEqual(run.top_blocks(2), ([], 0))
+        run.population = population_with(run, [], 5)
+        run.blocks = [run.make_block(s.parse_moves(text), origin="fixture")
+                      for text in ("U3", "C3 U3", "C3 U3", "B1 L2", "C3")]
+        run.batch = run.build_context_batch(run.population)
+        run.evaluate_blocks(run.blocks, run.batch)
+        top, scored = run.top_blocks(2)
+        self.assertEqual(scored, 5)
+        self.assertEqual([block.active for block in top], [s.parse_moves("C3 U3"), s.parse_moves("C3")])
+        self.assertEqual(top, sorted(top, key=s._block_sort_key))
+        self.assertIs(run.find_block(top[0].uid), top[0])
+        self.assertIsNone(run.find_block(10 ** 9))
+
+    def test_cli_prints_each_new_best_state_and_top_blocks(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = s.main(["--generations", "2"] + self.SMALL)
+            self.assertIs(sys.stdout, stdout)  # cube printing leaves no colorama wrapper behind
+            self.assertIs(sys.stderr, stderr)
+        output = stdout.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn(">>> New best state in generation 1", output)
+        self.assertIn("top move blocks on batch #1", output)
+        self.assertIn("#1 B", output)
+        self.assertIn("lowers H by up to", output)
+
     def test_zero_generations(self):
         code, output = quiet(s.main, ["--generations", "0"] + self.SMALL)
         self.assertEqual(code, 1)
