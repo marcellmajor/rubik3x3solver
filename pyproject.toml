@@ -1,0 +1,11 @@
+[project]
+name = "rubik3x3solver"
+version = "0.1.0"
+description = "Experimental solvers for a scrambled 3×3 Rubik's cube"
+requires-python = ">=3.12"
+dependencies = [
+    "colorama>=0.4.6",
+    "deap>=1.4.4",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+]
