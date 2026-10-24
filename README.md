@@ -63,6 +63,13 @@ standard Singmaster notation:
 | `U` / `D` | `rotate_up` / `rotate_down` |
 | `C` / `B` | `rotate_cloclkwise` *(sic)* / `rotate_backwards` |
 
+The letters say how a layer moves, not which face turns. `R` / `L` turn the
+bottom / top layer, `U` / `D` the right / left layer, `C` the front face
+clockwise and `B` the back face. The picture uses the default orientation:
+green top, orange front (`S2`), yellow right (`S3`).
+
+![What the six moves do: R turns the bottom layer, L the top, U the right, D the left, C the front clockwise and B the back](cube_moves.svg)
+
 `Solution.calculate_fitness(cube, chromosome, ...)` applies the genes to the
 cube **in place** (callers pass a clone), scoring after every gene as
 
