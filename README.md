@@ -15,8 +15,8 @@ solution.
 | [cube.py](cube.py) | `Cube` state, the six move operations, heuristic counters, terminal rendering, validation. |
 | [solution.py](solution.py) | `Solution`: move-sequence ("chromosome") handling and fitness evaluation used by [solver.py](solver.py). |
 | [solver.py](solver.py) | Hand-rolled solver: exhaustive combination search (single/multi-threaded, multiprocess, meet-in-the-middle), then a mutation/crossover hill-climb. |
-| [solver_deap.py](solver_deap.py) | DEAP genetic algorithm with elitism, algorithm-aware mutation, and a fitness plot. Current, most-tuned entry point. |
-| [solver_deap_coevolution.py](solver_deap_coevolution.py) | DEAP cooperative coevolution: solution candidates plus evolving move blocks, with a CLI. |
+| [solver_deap.py](solver_deap.py) | Earlier DEAP genetic algorithm with hall-of-fame elitism, algorithm-aware mutation, and a fitness plot. Hardcoded parameters, no CLI or tests. |
+| [solver_deap_coevolution.py](solver_deap_coevolution.py) | Main entry point: DEAP cooperative coevolution of solution candidates and evolving move blocks, with a CLI, selectable fitness functions, a persistent block library, diversity checks, the meet-in-the-middle finisher and optional adaptive recovery. |
 | [test_solver_deap_coevolution.py](test_solver_deap_coevolution.py) | Deterministic `unittest` suite for the coevolution solver. |
 | [test_mitm_finisher.py](test_mitm_finisher.py) | Tests for the meet-in-the-middle finisher (`--mitm`, on by default). |
 | [test_adaptive_recovery.py](test_adaptive_recovery.py) | Tests for the optional adaptive population recovery (`--adaptive-recovery`). |
@@ -154,7 +154,7 @@ original scramble.
 
 ## Cooperative coevolution solver ([solver_deap_coevolution.py](solver_deap_coevolution.py))
 
-A separate DEAP entry point that evolves two populations together:
+The main entry point, a DEAP solver that evolves two populations together:
 
 - **Solution candidates** are move sequences applied to the input cube. Each
   candidate is normalised to its best prefix and stored as exactly that
