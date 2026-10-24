@@ -23,9 +23,11 @@ Conventions used throughout this module:
   12 edges) that do not show all their correct colours.
 * "grouped-cubie" uses exact joint distances for five four-piece groups, with
   solo cubie distance and misplaced stickers as lower-priority tie-breakers.
-* "grouped-alternating" starts as grouped-cubie, switches to grouped-corners
-  once a best-ever cube that arrived in the current phase has every edge home
-  (and back once one has every corner home), and toggles likewise after more
+* "grouped-alternating" starts as grouped-corners, switches to grouped-cubie
+  once a best-ever cube that arrived in the current phase has every corner home
+  (and back once one has every edge home), never switches before a phase has
+  run DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS generations, and toggles
+  likewise after more
   than 500 generations without a cube-quality (solved, H) improvement -- a
   shorter sequence at equal H does not count; archive and population are
   re-scored at each switch.
@@ -82,14 +84,18 @@ from cube import Cube
 DEFAULT_FITNESS = "manhattan"
 DEFAULT_SOLUTION_POPULATION = 1500
 DEFAULT_BLOCK_POPULATION = 500
-DEFAULT_SOLUTION_CAPACITY = 76
-DEFAULT_BLOCK_CAPACITY = 32
-DEFAULT_CONTEXT_COUNT = 32
+DEFAULT_SOLUTION_CAPACITY = 64
+DEFAULT_BLOCK_CAPACITY = 24
+DEFAULT_CONTEXT_COUNT = 16
 DEFAULT_GENERATIONS = 10000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
 DEFAULT_LOG_EVERY = 10
 DEFAULT_MANHATTAN_WEIGHT = 1.0
 DEFAULT_MISPLACED_WEIGHT = 1.0
+# Grouped-alternating: a phase must run at least this many generations before
+# any switch (completion or stagnation). Early corners-home states are fragile;
+# switching to edge optimisation immediately tends to wreck them.
+DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS = 100
 
 # Solution-population diversity and stagnation checks (solution_population_diversity_specs.md).
 DIVERSITY_CHECK_INTERVAL = 50
@@ -699,7 +705,7 @@ class Objective:
         if self.state_function == "grouped-alternating":
             # Direct evaluation means the starting phase; a run resolves and
             # swaps its concrete phase objectives internally (CoevolutionRun).
-            return grouped_cubie_cost(key)
+            return grouped_corners_cost(key)
         if self.state_function == "corners-first":
             return corners_first_cost(key)
         if self.state_function == "edges":
@@ -728,9 +734,10 @@ class Objective:
                     f"{GROUPED_CORNER_PATTERN_WEIGHT}x, then cubie, then misplaced "
                     "(4096 * (2 * corner patterns + edge patterns) + 64 * cubie + misplaced)")
         if self.state_function == "grouped-alternating":
-            return (f"{self.name}: starts as grouped-cubie; switches to grouped-corners once a "
-                    "best-ever cube that arrived in the current phase has every edge home, back "
-                    "once one has every corner home, and "
+            return (f"{self.name}: starts as grouped-corners; switches to grouped-cubie once a "
+                    "best-ever cube that arrived in the current phase has every corner home, back "
+                    "once one has every edge home; no switch before a phase has run "
+                    f"{DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS} generations; and "
                     f"toggles after >{ALTERNATING_STAGNATION_GENERATIONS} generations without a "
                     "cube-quality (solved, H) improvement (archive and population re-scored at each switch)")
         if self.state_function == "corners-first":
@@ -2581,11 +2588,13 @@ class CoevolutionRun:
             "grouped-cubie": Objective("grouped-cubie", "grouped-cubie"),
             "grouped-corners": Objective("grouped-corners", "grouped-corners"),
         }
-        self._current_phase = "grouped-cubie"
+        self._current_phase = "grouped-corners"
         if self._alternating:
             objective = self._phase_objectives[self._current_phase]
         self._objective_switches = []
         self._alternating_stagnation_limit = ALTERNATING_STAGNATION_GENERATIONS
+        self._alternating_min_phase_generations = DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS
+        self._phase_start_generation = 0
         # Stagnation for phase switches is measured on real (solved, H) quality
         # improvements only, on its own clock (see _maybe_switch_objective).
         self._phase_last_quality_improvement = 0
@@ -3398,6 +3407,7 @@ class CoevolutionRun:
         # The new phase gets a full stagnation budget of its own, on the phase
         # clock only; the run-wide improvement counter stays truthful.
         self._phase_last_quality_improvement = generation
+        self._phase_start_generation = generation
         self._phase_start_endpoint = self.archive.endpoint
         self._objective_switches.append({
             "generation": generation,
@@ -3419,6 +3429,8 @@ class CoevolutionRun:
         cube-quality (solved, H) improvement toggles the phase.
         """
         if not self._alternating or self.archive.solved:
+            return
+        if generation - self._phase_start_generation < self._alternating_min_phase_generations:
             return
         corners = corner_cubie_distance(self.archive.endpoint)
         edges = edge_cubie_distance(self.archive.endpoint)
@@ -4249,9 +4261,14 @@ class CoevolutionRun:
         population = self.population or []
         endpoints = Counter(individual.endpoint for individual in population)
         empty = sum(1 for individual in population if not individual.active)
+        phase = ""
+        if self._alternating:
+            wrong_corners, wrong_edges = misplaced_cubies(archive.endpoint)
+            phase = (f" phase={self._current_phase} corners_home={8 - wrong_corners}/8 "
+                     f"edges_home={12 - wrong_edges}/12")
         lines = [
             f"[gen {self.completed_generation} | {self.budget.elapsed():.1f}s] best-ever cost={archive.cost} "
-            f"moves={len(archive.active)} solved={'yes' if archive.solved else 'no'} "
+            f"moves={len(archive.active)} solved={'yes' if archive.solved else 'no'}{phase} "
             f"generations since improvement={self.completed_generation - self.last_improvement_generation}",
             f"  solutions: distinct endpoints={len(endpoints)}/{len(population)} "
             f"(duplicate endpoints={len(population) - len(endpoints)}) empty={empty} | baseline-start "
