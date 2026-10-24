@@ -698,9 +698,11 @@ class ConfigAndCliTests(RecoveryTestCase):
     def test_cli_reports_startup_interventions_and_totals(self):
         with mock.patch.object(s, "default_input_cube", lambda: s.cube_from_key(PLATEAU)):
             with contextlib.redirect_stdout(io.StringIO()) as output:
+                # --no-mitm keeps this test on recovery output: the plateau cube (4 edges wrong) would
+                # otherwise make the default-on finisher build its depth-5 table first.
                 s.main(["--adaptive-recovery", "--generations", "160", "--solution-population", "20",
                         "--block-population", "20", "--contexts", "6", "--solution-capacity", "16",
-                        "--block-capacity", "8", "--seed", "3", "--no-block-library"])
+                        "--block-capacity", "8", "--seed", "3", "--no-block-library", "--no-mitm"])
             text = output.getvalue()
             self.assertIn("Adaptive recovery: after 2 consecutive health checks", text)
             self.assertIn("[gen 151] RECOVERY applied (solution-only)", text)

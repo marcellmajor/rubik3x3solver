@@ -43,8 +43,8 @@ The CLI also keeps a persistent library of up to 100 distinct move blocks
 (``--block-library PATH``, ``--no-block-library``); see
 persistent_move_block_library_specs.md.
 
-``--mitm`` adds an optional bounded meet-in-the-middle finisher that searches
-exactly from the best-ever candidate once few cubies are misplaced (off by default).
+The CLI also runs a bounded meet-in-the-middle finisher that searches exactly from
+the best-ever candidate once few cubies are misplaced (on by default; ``--no-mitm``).
 ``--adaptive-recovery`` adds an optional intervention for persistent stagnation with low
 solution-population diversity, decided at the diversity checks (off by default).
 
@@ -82,11 +82,11 @@ from cube import Cube
 # ---------------------------------------------------------------------------
 
 DEFAULT_FITNESS = "manhattan"
-DEFAULT_SOLUTION_POPULATION = 1500
+DEFAULT_SOLUTION_POPULATION = 1000
 DEFAULT_BLOCK_POPULATION = 500
-DEFAULT_SOLUTION_CAPACITY = 64
+DEFAULT_SOLUTION_CAPACITY = 80
 DEFAULT_BLOCK_CAPACITY = 24
-DEFAULT_CONTEXT_COUNT = 16
+DEFAULT_CONTEXT_COUNT = 32
 DEFAULT_GENERATIONS = 10000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
 DEFAULT_LOG_EVERY = 10
@@ -95,7 +95,7 @@ DEFAULT_MISPLACED_WEIGHT = 1.0
 # Grouped-alternating: a phase must run at least this many generations before
 # any switch (completion or stagnation). Early corners-home states are fragile;
 # switching to edge optimisation immediately tends to wreck them.
-DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS = 100
+DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS = 200
 
 # Solution-population diversity and stagnation checks (solution_population_diversity_specs.md).
 DIVERSITY_CHECK_INTERVAL = 50
@@ -1347,8 +1347,9 @@ class SearchConfig:
     diversity_max_dominance: float = DEFAULT_DIVERSITY_MAX_DOMINANCE
     diversity_min_cubie_distance: float = DEFAULT_DIVERSITY_MIN_CUBIE_DISTANCE
     stagnation_generations: int = DEFAULT_STAGNATION_GENERATIONS
-    # Optional bounded meet-in-the-middle finisher (off by default). ``mitm_cache`` is a
-    # directory for the reusable solved-side table, or None to keep it in memory only.
+    # Bounded meet-in-the-middle finisher: on by default in the CLI (--no-mitm turns it off),
+    # opt-in here. ``mitm_cache`` is a directory for the reusable solved-side table, or None
+    # to keep it in memory only.
     mitm: bool = False
     mitm_depth: int = DEFAULT_MITM_DEPTH
     mitm_trigger_cubies: int = DEFAULT_MITM_TRIGGER_CUBIES
@@ -4559,10 +4560,11 @@ def build_arg_parser():
                                f"(default {DEFAULT_RECOVERY_BLOCK_REFRESH_FRACTION})")
     finisher = parser.add_argument_group(
         "meet-in-the-middle finisher",
-        "Optional exact search from the best-ever candidate when few cubies are misplaced: a solved-side "
-        "table to floor(D/2) moves joined with a forward search to ceil(D/2) moves. Off by default.")
-    finisher.add_argument("--mitm", action=argparse.BooleanOptionalAction, default=False,
-                          help="enable the finisher (default: off)")
+        "Exact search from the best-ever candidate when few cubies are misplaced: a solved-side "
+        "table to floor(D/2) moves joined with a forward search to ceil(D/2) moves. On by default; "
+        "--no-mitm turns it off.")
+    finisher.add_argument("--mitm", action=argparse.BooleanOptionalAction, default=True,
+                          help="run the finisher (default: on; --no-mitm turns it off)")
     finisher.add_argument("--mitm-depth", type=int, default=DEFAULT_MITM_DEPTH,
                           help=f"total search depth D, 1-{MITM_MAX_DEPTH} (default {DEFAULT_MITM_DEPTH})")
     finisher.add_argument("--mitm-trigger-cubies", type=int, default=DEFAULT_MITM_TRIGGER_CUBIES,
@@ -4692,9 +4694,9 @@ def _print_startup(config, objective, seed, seed_generated, input_cube):
                  if objective.state_function == "corners-first" else "")
               + f", every >={config.mitm_interval} generations; {config.mitm_attempt_seconds:g}s per attempt, "
               f"{config.mitm_total_seconds:g}s total including table preparation; cache "
-              f"{config.mitm_cache or 'memory only'}")
+              f"{config.mitm_cache or 'memory only'} (--no-mitm turns it off)")
     else:
-        print("Finisher: disabled")
+        print("Finisher: disabled (--no-mitm)")
     if config.adaptive_recovery:
         print(f"Adaptive recovery: after {config.recovery_consecutive_checks} consecutive health checks with "
               f"NO_QUALITY_PROGRESS plus a diversity warning, rebuild the next generation's offspring; cooldown "

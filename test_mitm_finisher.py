@@ -763,8 +763,10 @@ class ConfigAndCliTests(FinisherTestCase):
         self.assertEqual((config.mitm, config.mitm_depth, config.mitm_trigger_cubies,
                           config.mitm_corners_first_edge_trigger, config.mitm_interval,
                           config.mitm_attempt_seconds, config.mitm_total_seconds),
-                         (False, 10, 4, 6, 50, 2.0, 30.0))
+                         (True, 10, 4, 6, 50, 2.0, 30.0))  # the CLI runs the finisher by default
         self.assertEqual(config.mitm_cache, os.path.join(os.environ["XDG_CACHE_HOME"], "rubik3x3solver"))
+        self.assertFalse(s.config_from_args(parser.parse_args(["--no-mitm"])).mitm)
+        self.assertFalse(s.SearchConfig().mitm)  # programmatic callers still opt in
         config = s.config_from_args(parser.parse_args(["--mitm", "--mitm-depth", "6", "--no-mitm-cache"]))
         self.assertEqual((config.mitm, config.mitm_depth, config.mitm_cache), (True, 6, None))
         config = s.config_from_args(parser.parse_args(["--mitm", "--no-mitm", "--mitm-cache-dir", "rel"]))
@@ -790,13 +792,28 @@ class ConfigAndCliTests(FinisherTestCase):
         self.assertIn("table built", text)
         self.assertTrue(os.path.exists(s.mitm_cache_file(self.cache, 2)))
 
-    def test_cli_disabled_line(self):
+    def test_cli_default_and_disabled_lines(self):
+        common = ["--no-block-library", "--generations", "0", "--solution-population", "10",
+                  "--block-population", "10", "--contexts", "4", "--seed", "1"]
         with mock.patch.object(s, "default_input_cube", lambda: s.cube_from_key(after(SOLVED, "R1 U1 C1"))):
             with contextlib.redirect_stdout(io.StringIO()) as output:
-                s.main(["--no-block-library", "--generations", "0", "--solution-population", "10",
-                        "--block-population", "10", "--contexts", "4", "--seed", "1"])
-        self.assertIn("Finisher: disabled", output.getvalue())
+                s.main(common)
+            self.assertIn("Finisher: meet-in-the-middle depth 10", output.getvalue())
+            self.assertIn("(--no-mitm turns it off)", output.getvalue())
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                s.main(common + ["--no-mitm"])
+        self.assertIn("Finisher: disabled (--no-mitm)", output.getvalue())
         self.assertNotIn("[finisher", output.getvalue())
+
+    def test_cli_runs_the_finisher_by_default(self):
+        with mock.patch.object(s, "default_input_cube", lambda: s.cube_from_key(after(SOLVED, "R1 U1 C1"))):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                code = s.main(["--no-block-library", "--mitm-depth", "4", "--mitm-trigger-cubies", "20",
+                               "--solution-population", "10", "--block-population", "10", "--contexts", "4",
+                               "--seed", "1"])
+        self.assertEqual(code, 0)
+        self.assertIn("[finisher gen 0]", output.getvalue())
+        self.assertIn("via finisher depth 4", output.getvalue())
 
 
 if __name__ == "__main__":

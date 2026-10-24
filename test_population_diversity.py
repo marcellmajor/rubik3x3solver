@@ -32,6 +32,9 @@ def setUpModule():
     _saved_environment["XDG_DATA_HOME"] = os.environ.get("XDG_DATA_HOME")
     _saved_environment["directory"] = tempfile.mkdtemp()
     os.environ["XDG_DATA_HOME"] = _saved_environment["directory"]
+    # The CLI's finisher is on by default and caches its table under XDG_CACHE_HOME.
+    _saved_environment["XDG_CACHE_HOME"] = os.environ.get("XDG_CACHE_HOME")
+    os.environ["XDG_CACHE_HOME"] = os.path.join(_saved_environment["directory"], "cache")
 
 
 def tearDownModule():
@@ -40,6 +43,10 @@ def tearDownModule():
         os.environ.pop("XDG_DATA_HOME", None)
     else:
         os.environ["XDG_DATA_HOME"] = _saved_environment["XDG_DATA_HOME"]
+    if _saved_environment["XDG_CACHE_HOME"] is None:
+        os.environ.pop("XDG_CACHE_HOME", None)
+    else:
+        os.environ["XDG_CACHE_HOME"] = _saved_environment["XDG_CACHE_HOME"]
 
 
 def rotated(key, slot):

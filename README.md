@@ -18,7 +18,7 @@ solution.
 | [solver_deap.py](solver_deap.py) | DEAP genetic algorithm with elitism, algorithm-aware mutation, and a fitness plot. Current, most-tuned entry point. |
 | [solver_deap_coevolution.py](solver_deap_coevolution.py) | DEAP cooperative coevolution: solution candidates plus evolving move blocks, with a CLI. |
 | [test_solver_deap_coevolution.py](test_solver_deap_coevolution.py) | Deterministic `unittest` suite for the coevolution solver. |
-| [test_mitm_finisher.py](test_mitm_finisher.py) | Tests for the optional meet-in-the-middle finisher (`--mitm`). |
+| [test_mitm_finisher.py](test_mitm_finisher.py) | Tests for the meet-in-the-middle finisher (`--mitm`, on by default). |
 | [test_adaptive_recovery.py](test_adaptive_recovery.py) | Tests for the optional adaptive population recovery (`--adaptive-recovery`). |
 | [benchmark_coevolution.py](benchmark_coevolution.py), [experiment_coevolution.txt](experiment_coevolution.txt) | Bounded comparison of the two DEAP solvers, and its recorded report. |
 | [pyproject.toml](pyproject.toml), [uv.lock](uv.lock) | Project metadata, dependencies, and the lockfile used by [uv](https://docs.astral.sh/uv/). |
@@ -333,9 +333,12 @@ reproducing the plain search exactly. Library callers opt in with
 
 ### Meet-in-the-middle finisher
 
-`--mitm` turns on an exact, bounded search that tries to finish the best-ever
-candidate once only a few cubies are wrong. It is off by default, and with it
-off nothing about the search changes.
+The CLI runs an exact, bounded search that tries to finish the best-ever
+candidate once only a few cubies are wrong. It is on by default; `--no-mitm`
+turns it off, and with it off nothing about the search changes. Library
+callers opt in with `SearchConfig(mitm=True)`; it is off by default there.
+The first attempt in a run builds or loads the solved-side table (see
+**Table cache** below).
 
 - **Search:** a table of every state within `floor(D/2)` moves of solved is
   joined with a breadth-first search to `ceil(D/2)` moves forward from the
@@ -441,10 +444,10 @@ starting values that still need benchmarking.
   generations between interventions. The cooldown is tracked separately from
   the stagnation count, and recovery never resets that count; only a better
   `(solved, H)` does.
-- **Finisher first:** with `--mitm`, that boundary's finisher attempt runs
-  before recovery is decided, under the finisher's own triggers, cache and
-  budgets. A finisher improvement goes into the population and postpones
-  recovery; a solve ends the run as usual.
+- **Finisher first:** with the finisher on (the CLI default), that
+  boundary's finisher attempt runs before recovery is decided, under the
+  finisher's own triggers, cache and budgets. A finisher improvement goes
+  into the population and postpones recovery; a solve ends the run as usual.
 - **First intervention (solutions only):** the next generation keeps the usual
   20% elite copies and 20% empty resets and rebuilds the 60% offspring portion.
   40% of those slots are fresh reduced sequences of 4–16 moves from the input
@@ -562,7 +565,7 @@ uv run python solver_deap_coevolution.py --fitness cubie-refined --seed 42
 uv run python solver_deap_coevolution.py --fitness grouped-cubie --seed 42
 uv run python solver_deap_coevolution.py --seed 42 --block-library my_blocks.json
 uv run python solver_deap_coevolution.py --seed 42 --no-block-library
-uv run python solver_deap_coevolution.py --seed 42 --mitm   # with the meet-in-the-middle finisher
+uv run python solver_deap_coevolution.py --seed 42 --no-mitm   # without the meet-in-the-middle finisher
 uv run python solver_deap_coevolution.py --seed 42 --adaptive-recovery
 uv run python -m unittest test_solver_deap_coevolution -v
 uv run python -m unittest test_block_library -v
