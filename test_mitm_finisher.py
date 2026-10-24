@@ -763,7 +763,7 @@ class ConfigAndCliTests(FinisherTestCase):
         self.assertEqual((config.mitm, config.mitm_depth, config.mitm_trigger_cubies,
                           config.mitm_corners_first_edge_trigger, config.mitm_interval,
                           config.mitm_attempt_seconds, config.mitm_total_seconds),
-                         (True, 10, 4, 6, 50, 2.0, 30.0))  # the CLI runs the finisher by default
+                         (True, 10, 4, 6, 50, 10.0, 30.0))  # the CLI runs the finisher by default
         self.assertEqual(config.mitm_cache, os.path.join(os.environ["XDG_CACHE_HOME"], "rubik3x3solver"))
         self.assertFalse(s.config_from_args(parser.parse_args(["--no-mitm"])).mitm)
         self.assertFalse(s.SearchConfig().mitm)  # programmatic callers still opt in

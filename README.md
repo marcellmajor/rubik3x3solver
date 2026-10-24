@@ -375,7 +375,7 @@ The first attempt in a run builds or loads the solved-side table (see
   generation 1, so the all-NOOP initial population is never changed. The
   suffix is offered to the block library like any other improving block.
 - **Time:** each attempt's forward search and result processing get
-  `--mitm-attempt-seconds` (2). Table preparation (building or loading the
+  `--mitm-attempt-seconds` (10). Table preparation (building or loading the
   table, writing the cache, and the one-time shortening table) does not count
   toward that limit. All attempts together, preparation included, get
   `--mitm-total-seconds` (30). Every phase checks these limits, `--time-limit`
@@ -406,12 +406,16 @@ The first attempt in a run builds or loads the solved-side table (see
   shown separately. The final report gives the number of attempts and the
   total finishing and preparation time.
 
-Under CPython a full depth-10 forward search visits 621,648 states and takes
-about 2.4 s with `manhattan`, slightly more than the 2 s default. Raise
-`--mitm-attempt-seconds` to let it finish.
+A complete depth-10 forward search visits 621,648 states. Under CPython it
+takes about 2.9 s with `manhattan`, 3.1 s with `cubie` and 5.1–5.4 s with
+`grouped-cubie` or `grouped-corners`; under PyPy the grouped fitnesses take
+5.9–6.7 s. The 10 s default lets it finish with any of them, and an attempt
+that completes or solves earlier returns at once. The 30 s total then allows
+about five complete attempts per run.
 
 Measured with 200 solutions, 100 blocks, solution capacity 32, block capacity
-16 and 16 contexts, `manhattan`, CPython, 60 s per run, seeds 42–44:
+16 and 16 contexts, `manhattan`, CPython, 60 s per run, seeds 42–44, and the
+earlier 2 s attempt limit:
 - **8-move scramble:** solved in 3 of 3 runs with the finisher (in 2.7–6.5 s,
   11 moves) and in 0 of 3 without it.
 - **Default cube** (4 edges wrong, more than 10 moves away): solved in 1 of 3

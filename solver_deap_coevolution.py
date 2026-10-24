@@ -111,7 +111,9 @@ DEFAULT_MITM_DEPTH = 10
 DEFAULT_MITM_TRIGGER_CUBIES = 4
 DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER = 6
 DEFAULT_MITM_INTERVAL = 50
-DEFAULT_MITM_ATTEMPT_SECONDS = 2.0
+# Long enough for a complete depth-10 search with the grouped fitnesses (about 5.4 s under
+# CPython, 6.7 s under PyPy); an attempt that finishes or solves earlier returns at once.
+DEFAULT_MITM_ATTEMPT_SECONDS = 10.0
 DEFAULT_MITM_TOTAL_SECONDS = 30.0
 
 # Optional adaptive population recovery (--adaptive-recovery). Initial engineering

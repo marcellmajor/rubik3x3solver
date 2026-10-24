@@ -1093,8 +1093,10 @@ class AlternatingFitnessTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
+    # --no-mitm: these CLI tests are not about the finisher, which would otherwise run its
+    # full depth-10 search whenever the module default cube is near solved.
     SMALL = ["--solution-population", "10", "--block-population", "10", "--solution-capacity", "8",
-             "--block-capacity", "4", "--contexts", "4", "--seed", "5", "--no-block-library"]
+             "--block-capacity", "4", "--contexts", "4", "--seed", "5", "--no-block-library", "--no-mitm"]
 
     def test_import_has_no_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:

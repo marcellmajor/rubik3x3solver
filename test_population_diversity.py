@@ -344,7 +344,7 @@ class LifecycleTests(unittest.TestCase):
     def test_final_report_does_not_replay_the_warning(self):
         args = ["--generations", "51", "--solution-population", "10", "--block-population", "10",
                 "--solution-capacity", "8", "--block-capacity", "4", "--contexts", "4", "--seed", "5",
-                "--no-block-library", "--diversity-min-unique-ratio", "1.0"]
+                "--no-block-library", "--diversity-min-unique-ratio", "1.0", "--no-mitm"]
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(s.main(args), 1)
         text = output.getvalue()
