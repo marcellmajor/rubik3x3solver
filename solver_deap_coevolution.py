@@ -82,11 +82,11 @@ from cube import Cube
 # ---------------------------------------------------------------------------
 
 DEFAULT_FITNESS = "manhattan"
-DEFAULT_SOLUTION_POPULATION = 1000
-DEFAULT_BLOCK_POPULATION = 500
-DEFAULT_SOLUTION_CAPACITY = 80
-DEFAULT_BLOCK_CAPACITY = 24
-DEFAULT_CONTEXT_COUNT = 32
+DEFAULT_SOLUTION_POPULATION = 12000
+DEFAULT_BLOCK_POPULATION = 3000
+DEFAULT_SOLUTION_CAPACITY = 72
+DEFAULT_BLOCK_CAPACITY = 14
+DEFAULT_CONTEXT_COUNT = 16
 DEFAULT_GENERATIONS = 10000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
 DEFAULT_LOG_EVERY = 10
@@ -411,9 +411,9 @@ def default_input_cube():
                                    "WGWRBBGWR",
     )
     #return Cube(
-    #                                "GGGGGGBGW",
-    #    [ "RRRRRRWRR",  "WWYWWWBWO",  "OOOOOOGOB",  "GYYYYYWYR", ],
-    #                                "YBOBBBYBB"
+    #                                "GGGBGWGGG",
+    #    [ "RRRRRRRRR", "WWWWWWWGW", "OOOOOOOOO", "YGYYYYYYY", ],
+    #                                "BBBYBBBBB"
     #)
 
 
