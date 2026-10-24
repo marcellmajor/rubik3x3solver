@@ -170,36 +170,88 @@ with a cap on duplicate sequences.
 Moves use the same `R L U D C B` letters with counts `1..3`, plus `NOOP`. A
 shared simplifier merges same-face turns and commutes opposite faces (`R`/`L`,
 `U`/`D`, `C`/`B`), so reported lengths are reduced, not globally minimal.
-`--fitness` picks `H`: `manhattan` (default, the heuristic above as a pure
-function), `misplaced`, the weighted `manhattan-misplaced`, `cubie`,
-`cubie-refined`, `grouped-cubie`, or `edges`. `cubie` is the sum over the 20 corner and edge
-cubies of the moves each would need on its own to reach its home slot and
-orientation; it and `cubie-refined` reject an input whose stickers do not
-form a consistent set of cubies (as does `grouped-cubie`). `cubie-refined` is `64 * cubie + misplaced`:
-the cubie cost stays strictly primary (misplaced counts only non-centre
-stickers, so it is at most 48 and can never outweigh one cubie unit), and
-the sticker count breaks the large ties between states with equal cubie
-cost, where selection otherwise has no gradient except length. `edges`
-counts the 20 blocks around the centres (8 corners and 12 edges) that do not
-show all their correct colours, so it scores whole blocks instead of single
-stickers on each side. Solved means every sticker matches its
-face centre, whatever `H` is in use, and every reported result is replayed
-from the original cube before it counts.
 
-`grouped-cubie` scores `4096 * P + 64 * cubie + misplaced`, where `P` is
-the sum of exact move distances for two groups of four corners and three
-groups of four edges, including their orientations. Within each piece type,
-groups follow the deterministic slot order derived from `cube.py`. Each group
-is solved jointly while ignoring the other pieces. The scales preserve that
-priority exactly; the sum is a heuristic, not a solution-length lower bound,
-and does not guarantee faster solving or eliminate all local minima.
+### Fitness functions
+
+Select the solution-state cost with `--fitness NAME`; the source-code default
+is `manhattan`. **Lower `H` is better**, and all nine choices below give zero
+for a solved cube. Solved status is checked independently by comparing every
+sticker with its face centre. Candidates rank by `(unsolved, H, length)`, so
+solved candidates win first, then lower cost, then shorter reduced sequences.
+Every accepted archive improvement is replayed from the original input.
+
+The formulas use these quantities:
+
+- `M`: misplaced stickers, each compared with its own face centre (0–48;
+  centres never contribute).
+- `D`: the legacy colour-offset Manhattan sum. For each sticker, sum the
+  absolute coordinate differences between its colour and its face-centre
+  colour in the fixed layout `G=(0,0)`, `R=(0,3)`, `W=(0,6)`, `O=(3,0)`,
+  `Y=(3,3)`, `B=(3,6)`. This is a colour-mismatch score, not a sticker's
+  physical travel distance; changing colour labels can change the score.
+- `C` and `E`: sums of individual shortest move distances home for the eight
+  corners and twelve edges, respectively, including position and orientation.
+  Each piece is considered independently, ignoring the others. `S = C + E`
+  is the `cubie` cost, bounded above by 52.
+- `P`: sum of five exact pattern distances: two groups of four corners and
+  three groups of four edges. Each group is solved jointly, ignoring pieces
+  outside that group. Distances use all 18 face turns; a half turn such as
+  `R2` counts as one move.
+
+| `--fitness` value | Cost `H` | What it rewards | Limitations / interpretation |
+|---|---|---|---|
+| `manhattan` **(default)** | `D` | Reducing sticker colour-offset mismatches. | Cheap legacy heuristic; its fixed colour layout does not model cube move distance or interactions between pieces. |
+| `manhattan-min` | `D` | Exactly the same states and ordering as `manhattan`. | Compatibility alias; it does not perform an additional minimum-distance search. |
+| `misplaced` | `M` | Putting more stickers on faces with matching centre colours. | Simple count with many ties; one wrong sticker counts equally regardless of how hard it is to correct. |
+| `manhattan-misplaced` | `wD * D + wM * M` | A configurable trade-off between colour-offset mismatch and misplaced-sticker count. Both weights default to `1.0`. | Weighted sum, not strict priority: an improvement in one component can compensate for worsening the other. |
+| `cubie` | `S` | Reducing the total distance of individual pieces from their correct positions and orientations. | Considers each piece alone; a turn moves multiple pieces, so the sum is not the number of moves remaining. Local minima and ties remain possible. |
+| `cubie-refined` | `64 * S + M` | Cubie distance first; fewer misplaced stickers breaks ties. | Strict priority because `M <= 48 < 64`. Adds discrimination within cubie ties but cannot accept a worse cubie sum in exchange for fewer misplaced stickers. |
+| `grouped-cubie` | `4096 * P + 64 * S + M` | Joint four-piece distances first, individual cubie distances second, misplaced stickers third. | Captures interactions within each group. Priority is strict; the sum across groups is still a heuristic. Requires additional pattern tables and scoring work. |
+| `corners-first` | `37 * C + E` | Corner distance first; edge distance breaks ties at every corner score. | Strict priority because `E <= 36`. Edges contribute even before corners are home. Once corners are solved, useful edge sequences may temporarily disturb them, so complete multi-move proposals matter. |
+| `edges` | Number of incorrectly positioned or oriented cubies (0–20) | Increasing the number of completely correct pieces. | Despite its name, includes **both eight corners and twelve edges**. Each wrong piece contributes one regardless of its distance home, so the score is coarse and can saturate. |
+
+These costs are selection heuristics; do not treat their values as certified
+remaining-move counts or admissible lower bounds. None guarantees convergence
+or a shortest solution.
+Although each individual/group distance is exact for its smaller problem,
+adding them can count the effects of the same turn more than once. Compare
+costs within the same objective and weights, not across different objectives.
+
+Set `--manhattan-weight` and `--misplaced-weight` only with
+`--fitness manhattan-misplaced`. Weights must be finite and nonnegative, at
+least one must be positive, and combinations that overflow are rejected.
+Changing the scale also changes what qualifies under the absolute
+`--min-block-gain` threshold (default `1.0`). The persistent block library
+always uses its own fixed `cubie-refined` reference evaluator, independent
+of the run's selected fitness.
+
+```bash
+uv run python solver_deap_coevolution.py --fitness cubie-refined --seed 42
+uv run python solver_deap_coevolution.py --fitness corners-first --seed 42
+uv run python solver_deap_coevolution.py --fitness manhattan-misplaced --manhattan-weight 1 --misplaced-weight 0.25 --seed 42
+```
+
+Normalisation keeps the best prefix of a complete proposal, including the
+empty prefix. Equal-cost longer prefixes lose to shorter ones. A complete
+proposal may pass through worse intermediate states and still be retained
+if its eventual best prefix improves the ranking; a low score does not mean
+that every next useful move will lower it.
+
+`cubie`, `cubie-refined`, `corners-first`, and `grouped-cubie` also validate
+that the input contains a consistent set of distinct cubies. This check
+alone does not establish physical solvability.
+
+For `grouped-cubie`, groups follow the deterministic slot order derived from
+`cube.py` within each piece type; they are not explicitly grouped by layer.
+Its priority scales are safe because `64 * 52 + 48 < 4096` and `48 < 64`.
 The five pattern tables are built lazily once per process, before the search
 timer starts, using all 18 turns (a half turn costs one move). Their direct
 indexing uses about 1.6 MiB of distance data, including unused overlap entries;
 construction needs additional temporary memory. Nothing is saved to disk.
 Scoring decodes each piece once: a lookup supplies its pattern-index
 contribution, solo distance, and misplaced-sticker count together.
-Existing selection, block scoring, and the default fitness remain unchanged.
+
+### Input and command-line options
 
 Unlike the older scripts it has a `main()` guard and no import side effects.
 The input is still hardcoded: `default_input_cube()` is a fully scrambled cube
