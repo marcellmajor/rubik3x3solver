@@ -23,6 +23,12 @@ Conventions used throughout this module:
   12 edges) that do not show all their correct colours.
 * "grouped-cubie" uses exact joint distances for five four-piece groups, with
   solo cubie distance and misplaced stickers as lower-priority tie-breakers.
+* "grouped-alternating" starts as grouped-cubie, switches to grouped-corners
+  once a best-ever cube that arrived in the current phase has every edge home
+  (and back once one has every corner home), and toggles likewise after more
+  than 500 generations without a cube-quality (solved, H) improvement -- a
+  shorter sequence at equal H does not count; archive and population are
+  re-scored at each switch.
 * Solved detection is independent of the objective: every sticker must equal
   its own face centre.
 
@@ -74,10 +80,10 @@ from cube import Cube
 # ---------------------------------------------------------------------------
 
 DEFAULT_FITNESS = "manhattan"
-DEFAULT_SOLUTION_POPULATION = 100000
-DEFAULT_BLOCK_POPULATION = 30000
-DEFAULT_SOLUTION_CAPACITY = 72
-DEFAULT_BLOCK_CAPACITY = 64
+DEFAULT_SOLUTION_POPULATION = 1500
+DEFAULT_BLOCK_POPULATION = 500
+DEFAULT_SOLUTION_CAPACITY = 76
+DEFAULT_BLOCK_CAPACITY = 32
 DEFAULT_CONTEXT_COUNT = 32
 DEFAULT_GENERATIONS = 10000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
@@ -125,9 +131,13 @@ RECOVERY_BLOCK_CONSECUTIVE_CHECKS = 2
 RECOVERY_DIVERSITY_FLAGS = ("LOW_UNIQUE_STATES", "DOMINANT_STATE", "LOW_CUBIE_SPREAD")
 
 FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie", "edges",
-                   "cubie-refined", "grouped-cubie", "corners-first")
+                   "cubie-refined", "grouped-cubie", "grouped-corners", "corners-first", "grouped-alternating")
 INTEGER_VALUED_FITNESS = ("manhattan", "manhattan-min", "misplaced", "cubie", "edges", "cubie-refined",
-                          "corners-first", "grouped-cubie")
+                          "corners-first", "grouped-cubie", "grouped-corners", "grouped-alternating")
+
+# Grouped-alternating toggles its phase after this many generations without a
+# cube-quality (solved, H) improvement (in addition to its completion switches).
+ALTERNATING_STAGNATION_GENERATIONS = 500
 
 # Ordinary solution-offspring operators and their probabilities (section 7.5).
 SOLUTION_OPERATOR_PROBABILITIES = (
@@ -387,16 +397,16 @@ def default_input_cube():
     The spec's original checkpoint from ``solver_deap.py`` is kept in
     ``benchmark_coevolution.CHECKPOINT_KEY``.
     """
-    #return Cube(
-    #                               "WYRYGRGRY",
-    #    ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"],
-    #                               "WGWRBBGWR",
-    #)
     return Cube(
-                                    "GGGYGWGGG",
-        [ "RORRRRRRR",  "WGWWWWWWW",  "OROOOOOOO",  "YGYYYYYYY", ],
-                                    "BBBBBBBBB"
-    )    
+                                   "WYRYGRGRY",
+        ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"],
+                                   "WGWRBBGWR",
+    )
+    #return Cube(
+    #                                "GGGGGGBGW",
+    #    [ "RRRRRRWRR",  "WWYWWWBWO",  "OOOOOOGOB",  "GYYYYYWYR", ],
+    #                                "YBOBBBYBB"
+    #)
 
 
 def validate_input_cube(cube):
@@ -643,6 +653,21 @@ def grouped_cubie_cost(key):
     return _grouped_cubie_tables().cost(_face_indices(key))
 
 
+# Corner patterns count this many times in grouped-corners (edges count once).
+GROUPED_CORNER_PATTERN_WEIGHT = 2
+
+
+def grouped_corners_cost(key):
+    """Grouped-cubie with corner patterns favoured: 4096*(2*corner patterns + edge patterns) + lower tiers.
+
+    Same exact pattern tables and tie-breakers as ``grouped_cubie_cost``;
+    only the two four-corner pattern distances are weighted double, so
+    corner progress and protection count for more without making corners
+    a strict lexicographic phase.
+    """
+    return _grouped_cubie_tables().corner_weighted_cost(_face_indices(key), GROUPED_CORNER_PATTERN_WEIGHT)
+
+
 @dataclass(frozen=True)
 class Objective:
     name: str
@@ -669,6 +694,12 @@ class Objective:
             return cubie_refined_cost(key)
         if self.state_function == "grouped-cubie":
             return grouped_cubie_cost(key)
+        if self.state_function == "grouped-corners":
+            return grouped_corners_cost(key)
+        if self.state_function == "grouped-alternating":
+            # Direct evaluation means the starting phase; a run resolves and
+            # swaps its concrete phase objectives internally (CoevolutionRun).
+            return grouped_cubie_cost(key)
         if self.state_function == "corners-first":
             return corners_first_cost(key)
         if self.state_function == "edges":
@@ -692,6 +723,16 @@ class Objective:
         if self.state_function == "grouped-cubie":
             return (f"{self.name}: joint four-piece distances, then cubie, then misplaced "
                     "(4096 * pattern sum + 64 * cubie + misplaced; not a length lower bound)")
+        if self.state_function == "grouped-corners":
+            return (f"{self.name}: joint four-piece distances with corner patterns weighted "
+                    f"{GROUPED_CORNER_PATTERN_WEIGHT}x, then cubie, then misplaced "
+                    "(4096 * (2 * corner patterns + edge patterns) + 64 * cubie + misplaced)")
+        if self.state_function == "grouped-alternating":
+            return (f"{self.name}: starts as grouped-cubie; switches to grouped-corners once a "
+                    "best-ever cube that arrived in the current phase has every edge home, back "
+                    "once one has every corner home, and "
+                    f"toggles after >{ALTERNATING_STAGNATION_GENERATIONS} generations without a "
+                    "cube-quality (solved, H) improvement (archive and population re-scored at each switch)")
         if self.state_function == "corners-first":
             return (f"{self.name}: corner cubie distance first (slot and orientation), "
                     f"then edge cubie distance ({CORNERS_FIRST_EDGE_SCALE} * corners + edges; "
@@ -713,7 +754,8 @@ def make_objective(name, manhattan_weight=None, misplaced_weight=None):
             raise ConfigError("--manhattan-weight/--misplaced-weight are valid only with "
                               "--fitness manhattan-misplaced")
         return Objective(name, name if name in ("misplaced", "cubie", "edges", "cubie-refined",
-                                               "grouped-cubie", "corners-first") else "manhattan")
+                                               "grouped-cubie", "grouped-corners",
+                                               "corners-first", "grouped-alternating") else "manhattan")
     weights = []
     for label, value, default in (
         ("manhattan", manhattan_weight, DEFAULT_MANHATTAN_WEIGHT),
@@ -1411,6 +1453,7 @@ class RunResult:
     diversity_seconds: float = 0.0
     finisher_report: Optional[dict] = None
     recovery_report: Optional[dict] = None
+    objective_switches: tuple = ()
 
 
 @dataclass
@@ -2531,6 +2574,24 @@ class CoevolutionRun:
 
     def __init__(self, config, input_key, objective, seed, *, budget=None, log=None, on_improvement=None):
         self.config = config
+        # Grouped-alternating runs swap between two concrete phase objectives;
+        # self.objective always holds the currently active one.
+        self._alternating = objective.state_function == "grouped-alternating"
+        self._phase_objectives = {
+            "grouped-cubie": Objective("grouped-cubie", "grouped-cubie"),
+            "grouped-corners": Objective("grouped-corners", "grouped-corners"),
+        }
+        self._current_phase = "grouped-cubie"
+        if self._alternating:
+            objective = self._phase_objectives[self._current_phase]
+        self._objective_switches = []
+        self._alternating_stagnation_limit = ALTERNATING_STAGNATION_GENERATIONS
+        # Stagnation for phase switches is measured on real (solved, H) quality
+        # improvements only, on its own clock (see _maybe_switch_objective).
+        self._phase_last_quality_improvement = 0
+        # Endpoint the current phase started from (set at each switch); a
+        # completion rule needs a best-ever cube different from this one.
+        self._phase_start_endpoint = None
         self.objective = objective
         self.seed = seed
         self.rng = random.Random(seed)
@@ -2590,7 +2651,7 @@ class CoevolutionRun:
         self.history = tools.Logbook()
 
         self._last_report_marker = None
-        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie", "corners-first"):
+        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie", "grouped-corners", "corners-first", "grouped-alternating"):
             validate_cubie_input(input_key)
         baseline = self.normalize_solution((), check_budget=False)
         self.baseline = baseline
@@ -2797,6 +2858,7 @@ class CoevolutionRun:
         self.last_improvement_generation = self.generation_in_progress
         if quality_improved:
             self.last_quality_improvement_generation = self.generation_in_progress
+            self._phase_last_quality_improvement = self.generation_in_progress
         if block_payload and self.library is not None and self.library.usable:
             self._library_note_payload(tuple(block_payload), self.archive.rank)
         if self.on_improvement is not None:
@@ -3296,6 +3358,83 @@ class CoevolutionRun:
             self._complete_recovery(pending, generation)
         return summary
 
+    def _switch_objective(self, target_phase, reason, generation):
+        """Swap the active phase objective and re-score everything it ranks.
+
+        States carry over unchanged; every stored cost derived from the old
+        objective (archive, baseline, population ranks) is recomputed under
+        the new one, and the state-cost cache is replaced so no state keeps
+        a score from the previous phase.
+        """
+        old_objective = self.objective
+        new_objective = self._phase_objectives[target_phase]
+        self.objective = new_objective
+        self._current_phase = target_phase
+        self.cost = CostCache(new_objective, self.counters)
+        self.archive = ArchiveEntry(self.archive.active, self.archive.endpoint,
+                                    self.cost(self.archive.endpoint), self.archive.solved,
+                                    self.archive.uid, self.archive.generation, self.archive.source,
+                                    self.archive.block_id)
+        self.baseline = NormalizedCandidate(self.baseline.active, self.baseline.endpoint,
+                                            self.cost(self.baseline.endpoint), self.baseline.solved,
+                                            self.baseline.capacity_rejected)
+        self.baseline_rank = self.baseline.rank
+        if self.population:
+            for individual in self.population:
+                individual.cost = self.cost(individual.endpoint)
+                individual.rank = (0 if individual.solved else 1, individual.cost, len(individual.active))
+                individual.objective_identity = new_objective.identity
+                individual.fitness.values = individual.rank
+            # The best-ever cube is re-chosen under the new objective: a
+            # population member may beat the re-scored archive cube.
+            best = min(self.population, key=lambda individual: individual.rank)
+            archive_rank = (0 if self.archive.solved else 1, self.archive.cost, len(self.archive.active))
+            if best.rank < archive_rank:
+                self.archive = ArchiveEntry(best.active, best.endpoint, best.cost, best.solved,
+                                            best.uid, best.created_generation,
+                                            best.operator or best.origin, best.block_id)
+        # Recovery quality tracking is denominated in the old objective.
+        self._recovery_quality_at_last = None
+        # The new phase gets a full stagnation budget of its own, on the phase
+        # clock only; the run-wide improvement counter stays truthful.
+        self._phase_last_quality_improvement = generation
+        self._phase_start_endpoint = self.archive.endpoint
+        self._objective_switches.append({
+            "generation": generation,
+            "from": old_objective.name,
+            "to": new_objective.name,
+            "reason": reason,
+        })
+        self.log(f"Objective switch at generation {generation}: {old_objective.name} -> "
+                 f"{new_objective.name} ({reason}); archive and population re-scored, "
+                 f"best-ever H is now {self.archive.cost}")
+
+    def _maybe_switch_objective(self, generation):
+        """Grouped-alternating phase changes, evaluated at a generation boundary.
+
+        Completion switches implement corners/edges staging on the best-ever
+        cube: a cube that arrived in the current phase with edges home sends
+        grouped-cubie to grouped-corners, corners home sends it back.
+        Otherwise, more than the stagnation limit of generations without a
+        cube-quality (solved, H) improvement toggles the phase.
+        """
+        if not self._alternating or self.archive.solved:
+            return
+        corners = corner_cubie_distance(self.archive.endpoint)
+        edges = edge_cubie_distance(self.archive.endpoint)
+        # Completion rules fire only for a best-ever cube that arrived in the
+        # current phase; the cube a phase started from must not bounce the
+        # phase straight back after a stagnation toggle.
+        new_best = self.archive.endpoint != self._phase_start_endpoint
+        if self._current_phase == "grouped-cubie" and new_best and edges == 0 and corners > 0:
+            self._switch_objective("grouped-corners", "all edges are in place", generation)
+        elif self._current_phase == "grouped-corners" and new_best and corners == 0 and edges > 0:
+            self._switch_objective("grouped-cubie", "all corners are in place", generation)
+        elif generation - self._phase_last_quality_improvement > self._alternating_stagnation_limit:
+            target = "grouped-corners" if self._current_phase == "grouped-cubie" else "grouped-cubie"
+            self._switch_objective(target, f"no cube-quality (solved, H) improvement for more than "
+                                           f"{self._alternating_stagnation_limit} generations", generation)
+
     def run(self):
         if self.baseline.solved:
             return self._result(STATUS_SOLVED, "the input cube is already solved")
@@ -3325,6 +3464,7 @@ class CoevolutionRun:
                 if self.config.diversity_checks and generation % DIVERSITY_CHECK_INTERVAL == 0:
                     diversity = self.diversity_checkpoint(generation)
                 self._record_history(generation, diversity=diversity)
+                self._maybe_switch_objective(generation)
                 if self.library is not None and self.library.usable:
                     scheduled = generation == 1 or generation % BLOCK_LIBRARY_CHECKPOINT_INTERVAL == 0
                     if scheduled or self._library_flush_requested:
@@ -4028,6 +4168,7 @@ class CoevolutionRun:
             diversity_seconds=self.diversity_seconds,
             finisher_report=self.finisher_report(),
             recovery_report=self.recovery_report(),
+            objective_switches=tuple(self._objective_switches),
         )
 
     # -- reporting (section 11) ----------------------------------------------------------
@@ -4578,6 +4719,10 @@ def _print_final(result, final, finalization_seconds):
         print(f"Finisher: {len(attempts)} attempt(s), finishing time {report['seconds']:.2f}s "
               f"(table preparation {report['preparation_seconds']:.2f}s, "
               f"table {report['table_source'] or 'not prepared'})")
+    if result.objective_switches:
+        switches = "; ".join(f"gen {switch['generation']}: {switch['from']} -> {switch['to']} "
+                             f"({switch['reason']})" for switch in result.objective_switches)
+        print(f"Objective switches: {switches}")
     recovery = result.recovery_report
     if recovery and recovery["enabled"]:
         print(f"Adaptive recovery: {recovery['interventions']} intervention(s) ({recovery['solution_only']} "
@@ -4680,7 +4825,7 @@ def main(argv=None, *, clock=None):
         objective = validate_config(config)
         input_cube = default_input_cube()
         input_key = validate_input_cube(input_cube)
-        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie", "corners-first"):
+        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie", "grouped-corners", "corners-first", "grouped-alternating"):
             validate_cubie_input(input_key)
     except (ConfigError, InvalidInputError) as exc:
         _print_status(STATUS_INVALID_INPUT, f"Invalid configuration or input: {exc}")

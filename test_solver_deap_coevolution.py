@@ -955,6 +955,106 @@ class BlockTests(unittest.TestCase):
         self.assertLessEqual(result.archive.rank, run.baseline_rank)
 
 
+class AlternatingFitnessTests(unittest.TestCase):
+    def test_resolves_starts_as_grouped_cubie_and_cli(self):
+        objective = s.make_objective("grouped-alternating")
+        self.assertEqual((objective.state_function, objective.integer_valued),
+                         ("grouped-alternating", True))
+        args = s.build_arg_parser().parse_args(["--fitness", "grouped-alternating"])
+        self.assertEqual(s.validate_config(s.config_from_args(args)).state_function,
+                         "grouped-alternating")
+        run = make_run(scrambled("R1 U1 C1"), fitness="grouped-alternating")
+        self.assertEqual(run.objective.name, "grouped-cubie")
+        self.assertEqual(run.archive.cost, s.grouped_cubie_cost(run.archive.endpoint))
+
+    def test_completion_switches_and_stagnation_toggle_rescore(self):
+        # Edges home, corners displaced (corner-only commutator from a probe).
+        run = make_run(scrambled("R1 U1 L1 U3 R3 U1 L3 U3"), fitness="grouped-alternating")
+        self.assertEqual(s.edge_cubie_distance(run.archive.endpoint), 0)
+        self.assertGreater(s.corner_cubie_distance(run.archive.endpoint), 0)
+        run._maybe_switch_objective(1)
+        self.assertEqual(run.objective.name, "grouped-corners")
+        self.assertEqual(run.archive.cost, s.grouped_corners_cost(run.archive.endpoint))
+        self.assertEqual(run.baseline.cost, s.grouped_corners_cost(run.baseline.endpoint))
+        self.assertEqual(run._objective_switches[-1]["reason"], "all edges are in place")
+        # Corners home, edges displaced: the corners-weighted phase switches back.
+        run = make_run(scrambled("R2 U2 C2 U2 R2 U2 C2 U2"), fitness="grouped-alternating")
+        self.assertEqual(s.corner_cubie_distance(run.archive.endpoint), 0)
+        self.assertGreater(s.edge_cubie_distance(run.archive.endpoint), 0)
+        run._current_phase = "grouped-corners"
+        run.objective = run._phase_objectives["grouped-corners"]
+        run._maybe_switch_objective(1)
+        self.assertEqual(run.objective.name, "grouped-cubie")
+        self.assertEqual(run._objective_switches[-1]["reason"], "all corners are in place")
+        # Stagnation: with a tiny limit, two stale checks toggle forth and back.
+        # Both must be stagnation switches: the archive cube has not changed,
+        # so neither completion rule may fire for it again.
+        run._alternating_stagnation_limit = 2
+        run._maybe_switch_objective(4)
+        self.assertEqual(run.objective.name, "grouped-corners")
+        self.assertIn("no cube-quality (solved, H) improvement", run._objective_switches[-1]["reason"])
+        run._maybe_switch_objective(7)
+        self.assertEqual(run.objective.name, "grouped-cubie")
+        self.assertIn("no cube-quality (solved, H) improvement", run._objective_switches[-1]["reason"])
+        self.assertEqual(len(run._objective_switches), 3)
+
+    def test_stagnation_toggle_is_not_undone_by_the_same_cube(self):
+        # Edges home: completion switches to grouped-corners at generation 1.
+        run = make_run(scrambled("R1 U1 L1 U3 R3 U1 L3 U3"), fitness="grouped-alternating")
+        run._maybe_switch_objective(1)
+        self.assertEqual(run.objective.name, "grouped-corners")
+        # After 500 stale generations it toggles back to grouped-cubie...
+        run._maybe_switch_objective(503)
+        self.assertEqual(run.objective.name, "grouped-cubie")
+        self.assertIn("no cube-quality (solved, H) improvement", run._objective_switches[-1]["reason"])
+        # ...and the unchanged edges-home cube must not switch it straight back.
+        switches = len(run._objective_switches)
+        run._maybe_switch_objective(504)
+        self.assertEqual(run.objective.name, "grouped-cubie")
+        self.assertEqual(len(run._objective_switches), switches)
+        # A genuinely new best-ever cube with edges home fires completion again.
+        endpoint = key_after(SOLVED_KEY, s.cube_inverse(s.parse_moves("R1 U1 L1 U3 R3 U1 L3 U3")))
+        self.assertEqual(s.edge_cubie_distance(endpoint), 0)
+        self.assertGreater(s.corner_cubie_distance(endpoint), 0)
+        run.archive = s.ArchiveEntry((), endpoint, s.grouped_cubie_cost(endpoint), False, None, 0, "test fixture")
+        run._maybe_switch_objective(505)
+        self.assertEqual(run.objective.name, "grouped-corners")
+        self.assertEqual(run._objective_switches[-1]["reason"], "all edges are in place")
+
+    def test_switch_rechooses_best_and_keeps_improvement_counter(self):
+        run = make_run(scrambled("R1 U1 C1"), fitness="grouped-alternating")
+        # Crossed pair: the archive cube is better under grouped-cubie, the
+        # population cube better under grouped-corners, so the test fails if
+        # the re-choice ranks by the old formula (or does not happen at all).
+        archive_candidate = run.normalize_solution(s.parse_moves("C2 U3 B3"))
+        population_candidate = run.normalize_solution(s.parse_moves("B3 D3 B3"))
+        self.assertLess(s.grouped_cubie_cost(archive_candidate.endpoint),
+                        s.grouped_cubie_cost(population_candidate.endpoint))
+        self.assertGreater(s.grouped_corners_cost(archive_candidate.endpoint),
+                           s.grouped_corners_cost(population_candidate.endpoint))
+        run.archive = s.ArchiveEntry(archive_candidate.active, archive_candidate.endpoint,
+                                     archive_candidate.cost, False, None, 0, "test archive")
+        individual = run.make_solution(population_candidate, origin="offspring", operator="test")
+        run.population = [individual]
+        run.last_improvement_generation = 7
+        run._switch_objective("grouped-corners", "test", 9)
+        self.assertEqual(run.archive.endpoint, individual.endpoint)
+        self.assertEqual(run.archive.cost, s.grouped_corners_cost(individual.endpoint))
+        # A switch is not an improvement: run-wide counter untouched, phase clock set.
+        self.assertEqual(run.last_improvement_generation, 7)
+        self.assertEqual(run._phase_last_quality_improvement, 9)
+
+    def test_short_alternating_run_finalizes_cleanly(self):
+        result = s.run_search(s.SearchConfig(fitness="grouped-alternating", seed=3, generations=6,
+                                             solution_population=20, block_population=20, contexts=4),
+                              scrambled("R1 U1 C1 L2"), log=lambda message: None)
+        self.assertIn(result.objective.name, ("grouped-cubie", "grouped-corners"))
+        self.assertIsInstance(result.objective_switches, tuple)
+        final = s.finalize_result(result)
+        self.assertNotEqual(final.status, s.STATUS_ERROR)
+        self.assertFalse(final.problems)
+
+
 class IntegrationTests(unittest.TestCase):
     SMALL = ["--solution-population", "10", "--block-population", "10", "--solution-capacity", "8",
              "--block-capacity", "4", "--contexts", "4", "--seed", "5", "--no-block-library"]

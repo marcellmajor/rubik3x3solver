@@ -159,3 +159,14 @@ class GroupedCubieTables:
         """Return 4096*pattern_sum + 64*cubie + misplaced with one decoding."""
         indices, lower = self._decode(face_indices)
         return 4096 * sum(self._lookup(indices)) + lower
+
+    def corner_weighted_cost(self, face_indices, corner_weight):
+        """Like :meth:`cost`, but the two corner patterns count ``corner_weight`` times.
+
+        Patterns are ordered corner groups first (indices 0-1), then the
+        three edge groups (indices 2-4); the lower tiers are unchanged.
+        """
+        indices, lower = self._decode(face_indices)
+        distances = self._lookup(indices)
+        weighted = corner_weight * (distances[0] + distances[1]) + sum(distances[2:])
+        return 4096 * weighted + lower

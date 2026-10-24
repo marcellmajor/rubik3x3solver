@@ -114,11 +114,32 @@ class GroupedCubieTests(unittest.TestCase):
         self.assertIn("grouped-cubie", output.getvalue())
         self.assertIn("Replayed cost", output.getvalue())
 
+    def test_grouped_corners_weights_corner_patterns_double(self):
+        args = s.build_arg_parser().parse_args(["--fitness", "grouped-corners"])
+        objective = s.validate_config(s.config_from_args(args))
+        self.assertEqual((objective.state_function, objective.integer_valued), ("grouped-corners", True))
+        self.assertEqual(s.grouped_corners_cost(SOLVED), 0)
+        rng = random.Random(31)
+        key = SOLVED
+        for _ in range(200):
+            key = moved(key, rng.choice(s.REAL_MOVES))
+            distances = self.distances(key)
+            lower = 64 * s.cubie_cost(key) + s.misplaced_cost(key)
+            self.assertEqual(s.grouped_corners_cost(key),
+                             4096 * (2 * (distances[0] + distances[1]) + sum(distances[2:])) + lower)
+            self.assertEqual(objective.cost(key), s.grouped_corners_cost(key))
+            self.assertEqual(s.grouped_corners_cost(key) == 0, key == SOLVED)
+        with self.assertRaises(s.ConfigError):
+            s.make_objective("grouped-corners", manhattan_weight=1)
+
     def test_invalid_cubies_and_inapplicable_weights_are_rejected(self):
         stickers = list(SOLVED)
         stickers[0], stickers[10] = stickers[10], stickers[0]
         with self.assertRaises(s.InvalidInputError):
             s.run_search(s.SearchConfig(fitness="grouped-cubie", generations=0),
+                         s.cube_from_key("".join(stickers)), log=lambda message: None)
+        with self.assertRaises(s.InvalidInputError):
+            s.run_search(s.SearchConfig(fitness="grouped-corners", generations=0),
                          s.cube_from_key("".join(stickers)), log=lambda message: None)
         with self.assertRaises(s.ConfigError):
             s.make_objective("grouped-cubie", manhattan_weight=1)

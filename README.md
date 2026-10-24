@@ -207,6 +207,8 @@ The formulas use these quantities:
 | `cubie` | `S` | Reducing the total distance of individual pieces from their correct positions and orientations. | Considers each piece alone; a turn moves multiple pieces, so the sum is not the number of moves remaining. Local minima and ties remain possible. |
 | `cubie-refined` | `64 * S + M` | Cubie distance first; fewer misplaced stickers breaks ties. | Strict priority because `M <= 48 < 64`. Adds discrimination within cubie ties but cannot accept a worse cubie sum in exchange for fewer misplaced stickers. |
 | `grouped-cubie` | `4096 * P + 64 * S + M` | Joint four-piece distances first, individual cubie distances second, misplaced stickers third. | Captures interactions within each group. Priority is strict; the sum across groups is still a heuristic. Requires additional pattern tables and scoring work. |
+| `grouped-corners` | `4096 * (2 * Pc + Pe) + 64 * S + M` | Like `grouped-cubie`, but the two four-corner pattern distances (`Pc`) count double against the three edge patterns (`Pe`), so corner progress and preservation weigh more. | Not a strict corner phase: edge gains can still outweigh corner regressions across the tiers. Benchmarked below `grouped-cubie` overall (6/40 vs 11/40 solves in a local 40-run comparison during development — two scrambles × 20 seeds, not a benchmark shipped in this repo), despite ending with corners home far more often. |
+| `grouped-alternating` | phases of `grouped-cubie` / `grouped-corners` | Starts as `grouped-cubie`; switches to `grouped-corners` once a best-ever cube that arrived in the current phase has every edge home, back once one has every corner home, and toggles phase after more than 500 generations without a cube-quality (solved, H) improvement — a shorter sequence at equal H does not count. Archive and population are re-scored at each switch; switches are printed as they happen and listed in the final report. | H values before and after a switch are on different scales and not directly comparable. Experimental: intended to break long stagnation plateaus by changing what selection rewards. |
 | `corners-first` | `37 * C + E` | Corner distance first; edge distance breaks ties at every corner score. | Strict priority because `E <= 36`. Edges contribute even before corners are home. Once corners are solved, useful edge sequences may temporarily disturb them, so complete multi-move proposals matter. |
 | `edges` | Number of incorrectly positioned or oriented cubies (0–20) | Increasing the number of completely correct pieces. | Despite its name, includes **both eight corners and twelve edges**. Each wrong piece contributes one regardless of its distance home, so the score is coarse and can saturate. |
 
@@ -237,11 +239,12 @@ proposal may pass through worse intermediate states and still be retained
 if its eventual best prefix improves the ranking; a low score does not mean
 that every next useful move will lower it.
 
-`cubie`, `cubie-refined`, `corners-first`, and `grouped-cubie` also validate
+`cubie`, `cubie-refined`, `corners-first`, `grouped-cubie`,
+`grouped-corners`, and `grouped-alternating` also validate
 that the input contains a consistent set of distinct cubies. This check
 alone does not establish physical solvability.
 
-For `grouped-cubie`, groups follow the deterministic slot order derived from
+For `grouped-cubie` (and `grouped-corners`, which reuses its tables), groups follow the deterministic slot order derived from
 `cube.py` within each piece type; they are not explicitly grouped by layer.
 Its priority scales are safe because `64 * 52 + 48 < 4096` and `48 < 64`.
 The five pattern tables are built lazily once per process, before the search
