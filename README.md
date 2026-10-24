@@ -19,6 +19,7 @@ solution.
 | [solver_deap_coevolution.py](solver_deap_coevolution.py) | DEAP cooperative coevolution: solution candidates plus evolving move blocks, with a CLI. |
 | [test_solver_deap_coevolution.py](test_solver_deap_coevolution.py) | Deterministic `unittest` suite for the coevolution solver. |
 | [test_mitm_finisher.py](test_mitm_finisher.py) | Tests for the optional meet-in-the-middle finisher (`--mitm`). |
+| [test_adaptive_recovery.py](test_adaptive_recovery.py) | Tests for the optional adaptive population recovery (`--adaptive-recovery`). |
 | [benchmark_coevolution.py](benchmark_coevolution.py), [experiment_coevolution.txt](experiment_coevolution.txt) | Bounded comparison of the two DEAP solvers, and its recorded report. |
 | [pyproject.toml](pyproject.toml), [uv.lock](uv.lock) | Project metadata, dependencies, and the lockfile used by [uv](https://docs.astral.sh/uv/). |
 
@@ -352,6 +353,114 @@ Cold and warm caches made the same attempts at the same generations. They
 differed only in preparation time: 1.4–1.5 s to build the table, 0.3 s to load
 it.
 
+### Adaptive population recovery
+
+`--adaptive-recovery` lets the solver step in when the search is stuck and its
+population has also lost diversity. It is off by default, and with it off the
+search is unchanged. It needs the diversity checks, so combining it with
+`--no-diversity-checks` is a configuration error. All of its thresholds are
+starting values that still need benchmarking.
+
+- **Trigger:** a scheduled health check (every 50 generations) qualifies when
+  it shows `NO_QUALITY_PROGRESS` together with at least one of
+  `LOW_UNIQUE_STATES`, `DOMINANT_STATE` or `LOW_CUBIE_SPREAD`. These use the
+  same thresholds as the warnings. Low diversity while quality still improves,
+  stagnation alone, or an unavailable measurement does not qualify, and any
+  check that does not qualify resets the count.
+  `--recovery-consecutive-checks` (2) qualifying checks in a row make an
+  intervention eligible. The evidence is then used up, so the next intervention
+  needs new consecutive checks.
+- **Cooldown:** at least `--recovery-cooldown-generations` (100) completed
+  generations between interventions. The cooldown is tracked separately from
+  the stagnation count, and recovery never resets that count; only a better
+  `(solved, H)` does.
+- **Finisher first:** with `--mitm`, that boundary's finisher attempt runs
+  before recovery is decided, under the finisher's own triggers, cache and
+  budgets. A finisher improvement goes into the population and postpones
+  recovery; a solve ends the run as usual.
+- **First intervention (solutions only):** the next generation keeps the usual
+  20% elite copies and 20% empty resets and rebuilds the 60% offspring portion.
+  40% of those slots are fresh reduced sequences of 4–16 moves from the input
+  cube. 40% are 2–4 of the usual move variations applied in a row to one
+  parent. 20% insert one block into a parent and append a second, different
+  one.
+  - Parents cycle through the distinct endpoints of the usual parent pool in
+    shuffled order, so every endpoint, the best included, is used once before
+    any repeats.
+  - Each complete proposal is normalised and verified once, as usual, so a
+    proposal may pass through worse states on the way.
+  - A slot whose normalised endpoint is already in the new population retries
+    up to 3 times, then keeps its last valid proposal and counts as a
+    uniqueness shortfall.
+  - Offspring are not filtered by fitness, and the archive rules are
+    unchanged.
+- **Escalation (adds a partial block refresh):** this happens only on a later
+  intervention when the best-ever quality has not improved since the previous
+  one. The block population must also have been unhealthy at 2 consecutive
+  checks, measured on the latest shared-context evaluation. Unhealthy means
+  fewer than 50% distinct move transformations (equivalent spellings count
+  once) or no block improving any context. Here improving means any lower cost
+  within the solution capacity, whatever `--min-block-gain` is. A missing or
+  stale evaluation is not counted as unhealthy. The escalation is checked again
+  after the recovery generation's block evaluation and is dropped if that
+  evaluation improved the best-ever quality.
+  - The refresh replaces up to `--recovery-block-refresh-fraction` (0.25, at
+    most 0.5) of the blocks.
+  - The top tenth of the blocks is protected, as is the best block of every
+    improving transformation. Redundant weak blocks go first, then redundant
+    improving ones, then distinct blocks that improve no context.
+  - Replacements alternate fresh and varied blocks under the usual capacity
+    and duplicate cap, preferring new transformations. They are scored on the
+    same batch before anything uses them.
+  - The persistent block library is never cleared or rewritten.
+  - A genuine quality improvement resets escalation.
+- **Interruptions:** an intervention is built while the next generation is
+  constructed, so a timeout or Ctrl+C keeps the last fully published
+  population.
+- **Output:** each check prints the block health and the recovery condition.
+  Each intervention prints separately from the warnings:
+  - when it was scheduled and applied, and its trigger IDs and streak
+  - the generations without better quality
+  - the finisher outcome
+  - the counts of elites, recovery offspring by kind and resets, plus the
+    novelty retries and shortfall
+  - the block refresh with its health evidence, or the reason it was skipped
+  - endpoint diversity before and after publication
+  - the time it took
+  The final report counts interventions and total recovery time. Higher
+  diversity after an intervention is not, by itself, evidence that it helped.
+
+**Limitation:** normalisation keeps only the best-scoring prefix of each
+proposal, and the empty prefix counts, so a stored candidate's state is
+strictly better than the input cube's. A proposal that never gets better than
+the input is normalised back to the empty baseline. One that does is kept,
+even when the whole population sits on the baseline. For example, on the
+default cube `B3 U3 R2 U1 R1 U1 R3 U3 R3 U3 R3 U1 R3 U1 B1` survives
+normalisation unchanged and lowers `manhattan` from 36 to 30. In the benchmark
+below, none of the sampled recovery proposals found such a sequence, so
+diversity did not rise. That was a sampling failure, not an impossibility.
+
+Measured with 200 solutions, 100 blocks, solution capacity 32, block capacity
+16 and 16 contexts, `manhattan`, 60 s per run, seeds 42–44: nothing was solved
+in 12 runs with recovery or 12 without.
+- **Default and checkpoint cubes:** recovery fired 38–67 times per run and
+  took 1.0–1.7 s in total.
+  - Where the search stayed on the empty baseline (both checkpoint runs, and
+    the default cube with seed 44), every intervention ended with all 120
+    offspring on the baseline endpoint. Diversity stayed at 1/160, and the
+    final `H` matched the runs without recovery.
+  - On the default cube with seeds 42 and 43, the runs left the baseline and
+    their trajectories diverged: seed 42 reached `H` 18 both ways (earlier with
+    recovery), and seed 43 reached `H` 24 with recovery against 18 without.
+  - The unique-endpoint ratio after an intervention was within 0.1 percentage
+    points of the ratio before it.
+- **8- and 10-move scrambles:** the population stayed diverse while it
+  stalled, so recovery never fired. The final results matched the runs without
+  it. At a fixed 300 generations, recovery mode took 19.75 s against 19.77 s.
+
+These runs show no benefit on these cubes; three seeds per cube are not enough
+to measure a small effect either way.
+
 ## Benchmark ([benchmark_coevolution.py](benchmark_coevolution.py))
 
 Runs both DEAP solvers on the active checkpoint from `solver_deap.py` for
@@ -387,10 +496,12 @@ uv run python solver_deap_coevolution.py --fitness grouped-cubie --seed 42
 uv run python solver_deap_coevolution.py --seed 42 --block-library my_blocks.json
 uv run python solver_deap_coevolution.py --seed 42 --no-block-library
 uv run python solver_deap_coevolution.py --seed 42 --mitm   # with the meet-in-the-middle finisher
+uv run python solver_deap_coevolution.py --seed 42 --adaptive-recovery
 uv run python -m unittest test_solver_deap_coevolution -v
 uv run python -m unittest test_block_library -v
 uv run python -m unittest test_population_diversity -v
 uv run python -m unittest test_mitm_finisher -v
+uv run python -m unittest test_adaptive_recovery -v
 uv run python benchmark_coevolution.py   # ~15 minutes
 ```
 

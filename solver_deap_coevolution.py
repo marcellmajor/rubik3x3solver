@@ -37,6 +37,8 @@ persistent_move_block_library_specs.md.
 
 ``--mitm`` adds an optional bounded meet-in-the-middle finisher that searches
 exactly from the best-ever candidate once few cubies are misplaced (off by default).
+``--adaptive-recovery`` adds an optional intervention for persistent stagnation with low
+solution-population diversity, decided at the diversity checks (off by default).
 
 Importing this module runs no search, prints nothing, creates no plots and
 touches no library or table cache file.
@@ -99,6 +101,28 @@ DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER = 6
 DEFAULT_MITM_INTERVAL = 50
 DEFAULT_MITM_ATTEMPT_SECONDS = 2.0
 DEFAULT_MITM_TOTAL_SECONDS = 30.0
+
+# Optional adaptive population recovery (--adaptive-recovery). Initial engineering
+# defaults that still need benchmarking, not tuned values.
+DEFAULT_RECOVERY_CONSECUTIVE_CHECKS = 2
+DEFAULT_RECOVERY_COOLDOWN_GENERATIONS = 100
+DEFAULT_RECOVERY_BLOCK_REFRESH_FRACTION = 0.25
+RECOVERY_MAX_BLOCK_REFRESH_FRACTION = 0.50
+# Mixture of the 60% offspring portion of a recovery generation, as shares of those slots;
+# block-combination proposals take the rounding remainder (0.20 at these shares).
+RECOVERY_FRESH_SHARE = 0.40     # a random reduced sequence applied to the original input cube
+RECOVERY_MUTATION_SHARE = 0.40  # several move variations of one distinct-endpoint parent
+RECOVERY_FRESH_MIN_MOVES = 4    # fresh proposal length, capped by the solution capacity
+RECOVERY_FRESH_MAX_MOVES = 16
+RECOVERY_MUTATION_MIN_OPERATIONS = 2  # existing move variations applied in a row, normalised once
+RECOVERY_MUTATION_MAX_OPERATIONS = 4
+RECOVERY_MUTATION_VARIATIONS = ("insert-moves", "delete-gene", "substitute-gene", "span-replace")
+RECOVERY_NOVELTY_RETRIES = 3    # extra proposals per slot while its normalised endpoint repeats
+# Block-population health for escalation (experimental): unhealthy when fewer than half of the
+# evaluated blocks are distinct move transformations, or when no block improved any context.
+RECOVERY_BLOCK_MIN_DISTINCT_RATIO = 0.50
+RECOVERY_BLOCK_CONSECUTIVE_CHECKS = 2
+RECOVERY_DIVERSITY_FLAGS = ("LOW_UNIQUE_STATES", "DOMINANT_STATE", "LOW_CUBIE_SPREAD")
 
 FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie", "edges",
                    "cubie-refined", "grouped-cubie", "corners-first")
@@ -1144,6 +1168,9 @@ class ContextOutcome:
     context_id: int
     best: Optional[PrefixOutcome]
     qualifying: tuple
+    # Some prefix within the solution capacity lowers the cost (or solves) at all, whether or
+    # not it meets --min-block-gain; used by block-health diagnostics, never by scoring.
+    improved: bool = False
 
 
 @dataclass(frozen=True)
@@ -1155,6 +1182,7 @@ class BlockEvaluation:
     mean_relative_gain: float
     max_relative_gain: float
     active_length: int
+    improving_contexts: int = 0  # contexts with any capacity-feasible strict improvement
 
     @property
     def score(self):
@@ -1280,6 +1308,11 @@ class SearchConfig:
     mitm_attempt_seconds: float = DEFAULT_MITM_ATTEMPT_SECONDS
     mitm_total_seconds: float = DEFAULT_MITM_TOTAL_SECONDS
     mitm_cache: Optional[str] = None
+    # Optional adaptive population recovery (off by default); reuses the diversity checks.
+    adaptive_recovery: bool = False
+    recovery_consecutive_checks: int = DEFAULT_RECOVERY_CONSECUTIVE_CHECKS
+    recovery_cooldown_generations: int = DEFAULT_RECOVERY_COOLDOWN_GENERATIONS
+    recovery_block_refresh_fraction: float = DEFAULT_RECOVERY_BLOCK_REFRESH_FRACTION
 
 
 def _require_int(name, value, minimum):
@@ -1337,6 +1370,18 @@ def validate_config(config):
             raise ConfigError(f"{name} must be finite and strictly positive, got {value!r}")
     if config.mitm_cache is not None and (not isinstance(config.mitm_cache, str) or not config.mitm_cache):
         raise ConfigError("mitm cache must be a non-empty directory path or None")
+    if type(config.adaptive_recovery) is not bool:
+        raise ConfigError("adaptive recovery must be True or False")
+    _require_int("recovery consecutive checks", config.recovery_consecutive_checks, 1)
+    _require_int("recovery cooldown generations", config.recovery_cooldown_generations, 1)
+    fraction = config.recovery_block_refresh_fraction
+    if (type(fraction) not in (int, float) or not math.isfinite(fraction)
+            or not 0 <= fraction <= RECOVERY_MAX_BLOCK_REFRESH_FRACTION):
+        raise ConfigError(f"recovery block refresh fraction must be a finite number in "
+                          f"[0, {RECOVERY_MAX_BLOCK_REFRESH_FRACTION}], got {fraction!r}")
+    if config.adaptive_recovery and not config.diversity_checks:
+        raise ConfigError("adaptive recovery needs the diversity checks it is triggered by; "
+                          "drop --no-diversity-checks or disable adaptive recovery")
     validate_operator_probabilities()
     return make_objective(config.fitness, config.manhattan_weight, config.misplaced_weight)
 
@@ -1365,6 +1410,7 @@ class RunResult:
     diversity_records: list = field(default_factory=list)
     diversity_seconds: float = 0.0
     finisher_report: Optional[dict] = None
+    recovery_report: Optional[dict] = None
 
 
 @dataclass
@@ -2051,6 +2097,60 @@ def diversity_report_lines(record, previous_flagged):
     return lines
 
 
+def measure_block_health(blocks, batch_serial):
+    """Distinct move transformations and improving blocks of one common-context evaluation.
+
+    Every block must carry an evaluation from batch ``batch_serial``; otherwise the record is
+    unavailable, which is never evidence of unhealthy blocks. Equivalent sequences (the same
+    54-sticker permutation) count as one transformation. A block is improving when some prefix
+    within the solution capacity lowers a context's cost at all, independent of --min-block-gain.
+    Reads only sequences and stored evaluations: no randomness, no cost evaluation, no
+    comparison across batches.
+    """
+    record = {"available": False, "reason": None, "batch": batch_serial, "count": len(blocks),
+              "distinct": None, "distinct_ratio": None, "improving": None, "improving_fraction": None,
+              "flags": [], "unhealthy": False}
+    if not blocks:
+        record["reason"] = "no evaluated block population"
+        return record
+    # ``block.batch_serial`` names the batch a block was scored on; a cached evaluation reused for an
+    # identical batch keeps the serial of the batch that first computed it.
+    if any(getattr(block, "evaluation", None) is None or block.batch_serial != batch_serial for block in blocks):
+        record["reason"] = "missing or stale block evaluations"
+        return record
+    permutations = {}
+    for block in blocks:
+        if block.active not in permutations:
+            permutations[block.active] = block_permutation(block.active)
+    distinct = len(set(permutations.values()))
+    improving = sum(1 for block in blocks if block.evaluation.improving_contexts)
+    record.update(available=True, distinct=distinct, distinct_ratio=distinct / len(blocks), improving=improving,
+                  improving_fraction=improving / len(blocks))
+    if record["distinct_ratio"] < RECOVERY_BLOCK_MIN_DISTINCT_RATIO:
+        record["flags"].append("LOW_DISTINCT_TRANSFORMATIONS")
+    if improving == 0:
+        record["flags"].append("NO_IMPROVING_BLOCKS")
+    record["unhealthy"] = bool(record["flags"])
+    return record
+
+
+def block_health_text(record):
+    if not record["available"]:
+        return f"unavailable ({record['reason']})"
+    return (f"{record['distinct']}/{record['count']} distinct transformations "
+            f"({100 * record['distinct_ratio']:.1f}%), {record['improving']}/{record['count']} blocks improving "
+            f"a context ({100 * record['improving_fraction']:.1f}%) on batch #{record['batch']}; "
+            f"flags: {', '.join(record['flags']) if record['flags'] else 'none'}")
+
+
+def diversity_summary_text(record):
+    """Non-reset endpoint diversity in the regular health-check definitions, on one line."""
+    if not record["available"] or not record["non_reset"]["count"]:
+        return f"unavailable ({record['reason'] or 'no non-reset candidates'})"
+    unique, dominant, spread = _subset_text(record["non_reset"], "non-reset")
+    return f"unique endpoints {unique}; dominant endpoint {dominant}; mean differing cubies {spread}"
+
+
 # ---------------------------------------------------------------------------
 # Bounded meet-in-the-middle finisher (optional, --mitm)
 # ---------------------------------------------------------------------------
@@ -2452,6 +2552,17 @@ class CoevolutionRun:
         self.finisher_seconds = 0.0
         self.finisher_preparation_seconds = 0.0
         self.finisher_table_source = None
+        self.finisher_skip_reason = None  # why the latest boundary made no attempt
+        # Adaptive population recovery state (unused while config.adaptive_recovery is False).
+        self._recovery_solution_streak = 0   # consecutive qualifying solution-health checks
+        self._recovery_block_streak = 0      # consecutive unhealthy block-health checks
+        self._recovery_last_generation = None  # generation built by the latest intervention
+        self._recovery_quality_at_last = None  # best-ever (unsolved, H) when it was scheduled
+        self._recovery_pending = None        # intervention scheduled for the next generation
+        self._evaluated_blocks = None        # (batch serial, generation, blocks) of the latest evaluation
+        self.recovery_records = []
+        self.recovery_seconds = 0.0
+        self.recovery_postponements = 0
         self.last_block_summary = None
         self.history = tools.Logbook()
 
@@ -2725,6 +2836,7 @@ class CoevolutionRun:
             mean_gain,
             max_gain,
             len(sequence),
+            sum(1 for outcome in outcomes if outcome.improved),
         )
 
     def _evaluate_block_on_context(self, sequence, context, block_uid):
@@ -2738,6 +2850,7 @@ class CoevolutionRun:
         qualifying = []
         best = None
         best_preference = None
+        improved = False
         for k, allele in enumerate(sequence, 1):
             self.budget.check()
             key = apply_move_to_key(key, allele, self.counters)
@@ -2745,6 +2858,8 @@ class CoevolutionRun:
             cost = self.cost(key)
             delta = context.cost - cost
             solved = not context.solved and is_solved_key(key)
+            if not improved and (solved or delta > 0) and reducer.length <= capacity:
+                improved = True
             if not solved and not gain_qualifies(delta, threshold, integer_valued):
                 continue
             length = reducer.length
@@ -2763,7 +2878,7 @@ class CoevolutionRun:
                 self._archive_block_discovery(context, sequence, outcome, block_uid)
         if best is not None:
             self._archive_block_discovery(context, sequence, best, block_uid)
-        return ContextOutcome(context.context_id, best, tuple(qualifying))
+        return ContextOutcome(context.context_id, best, tuple(qualifying), improved)
 
     def _archive_block_discovery(self, context, sequence, outcome, block_uid):
         """Rebuild source + prefix from the original input and offer it to the archive."""
@@ -3113,25 +3228,49 @@ class CoevolutionRun:
         batch = self.build_context_batch(ranked)
         self.batch = batch
         self.partial_phase = "block evaluation"
-        self.evaluate_blocks(self.blocks, batch)
-        self._index_blocks(self.blocks, batch)
+        blocks = self.blocks
+        self.evaluate_blocks(blocks, batch)
+        pending = self._recovery_pending
+        if pending is not None and pending["apply_generation"] != generation:
+            pending = None
+        if pending is not None and pending["refresh_blocks"] and self._quality() != pending["quality"]:
+            # Block evaluation just improved the best-ever quality, which resets escalation.
+            pending.update(refresh_blocks=False, type="solution-only", block_refresh_limit=0,
+                           block_note="cancelled (cube quality improved during this generation's block "
+                                      "evaluation)")
+        if pending is not None and pending["refresh_blocks"]:
+            # Escalated recovery: replacements are scored on this same batch before any use.
+            self.partial_phase = "recovery block refresh"
+            blocks = self._refresh_blocks(blocks, batch, pending)
+            self._recovery_block_streak = 0  # the block evidence is used up
+        self._index_blocks(blocks, batch)
+        if self.config.adaptive_recovery:
+            self._evaluated_blocks = (batch.serial, generation, blocks)
         if self.library is not None and self.library.usable:
             # The last complete block evaluation, taken before survivors are replaced.
             self._library_snapshot = tuple((block.active, block.evaluation) for block in self._block_representatives)
-        summary = self._block_summary(self.blocks, batch)
-        self.partial_phase = "solution variation"
-        next_population = self.next_solution_population(self.population)
+        summary = self._block_summary(blocks, batch)
+        if pending is not None:
+            self.partial_phase = "recovery solution offspring"
+            next_population = self.recovery_solution_population(self.population, pending)
+        else:
+            self.partial_phase = "solution variation"
+            next_population = self.next_solution_population(self.population)
         next_blocks = None
         if build_next_blocks:
             self.partial_phase = "block replacement"
-            next_blocks = self.next_block_population(self.blocks)
+            next_blocks = self.next_block_population(blocks)
         self.population = next_population
         if next_blocks is not None:
             self.blocks = next_blocks
+        elif blocks is not self.blocks:
+            self.blocks = blocks  # the refreshed, evaluated blocks of a final generation
         self.last_block_summary = summary
         self.completed_generation = generation
         self.partial_generation = None
         self.partial_phase = None
+        if pending is not None:
+            self._complete_recovery(pending, generation)
         return summary
 
     def run(self):
@@ -3167,7 +3306,9 @@ class CoevolutionRun:
                     scheduled = generation == 1 or generation % BLOCK_LIBRARY_CHECKPOINT_INTERVAL == 0
                     if scheduled or self._library_flush_requested:
                         self._library_checkpoint(include_snapshot=scheduled)
-                self.finisher_attempt(generation)
+                finisher_summary = self.finisher_attempt(generation)
+                if diversity is not None and self.config.adaptive_recovery:
+                    self.recovery_checkpoint(generation, diversity, finisher_summary)
                 if generation % self.config.log_every == 0:
                     self.report_progress()
             self._library_final_candidates()
@@ -3179,6 +3320,356 @@ class CoevolutionRun:
             # No new reference evaluations after a time limit or SIGINT; completed ones are kept.
             return self._result(stop.status, str(stop) or stop.status)
 
+    # -- adaptive population recovery (optional, --adaptive-recovery) ---------------------
+
+    def _quality(self):
+        """Best-ever cube quality: solved status, then the selected cost (length excluded)."""
+        return (0 if self.archive.solved else 1, self.archive.cost)
+
+    def block_health(self, generation):
+        """Health of the blocks evaluated in ``generation`` (unavailable if that is not the latest)."""
+        evaluated = self._evaluated_blocks
+        if evaluated is None or evaluated[1] != generation:
+            record = measure_block_health((), None)
+            record["reason"] = f"no common-context block evaluation from generation {generation}"
+            return record
+        serial, _, blocks = evaluated
+        return measure_block_health(blocks, serial)
+
+    def recovery_checkpoint(self, generation, record, finisher_summary):
+        """Update recovery evidence from one scheduled health check; maybe schedule an intervention.
+
+        Runs after that boundary's diversity check, library checkpoint and finisher attempt.
+        Uses no randomness; an intervention only takes effect when the next generation is built.
+        """
+        started = time.monotonic()
+        try:
+            self._recovery_evidence(generation, record, finisher_summary)
+        finally:
+            seconds = time.monotonic() - started
+            self.recovery_seconds += seconds
+            if self._recovery_pending is not None and self._recovery_pending["scheduled_generation"] == generation:
+                self._recovery_pending["seconds"] += seconds
+
+    def _recovery_evidence(self, generation, record, finisher_summary):
+        config = self.config
+        flags = record.get("flags") or []
+        diversity_flags = [flag for flag in flags if flag in RECOVERY_DIVERSITY_FLAGS]
+        qualifying = bool(record["available"] and "NO_QUALITY_PROGRESS" in flags and diversity_flags)
+        # Anything else, an unavailable measurement included, breaks the streak.
+        self._recovery_solution_streak = self._recovery_solution_streak + 1 if qualifying else 0
+        health = self.block_health(generation)
+        self._recovery_block_streak = self._recovery_block_streak + 1 if health["unhealthy"] else 0
+        record["block_health"] = health
+        record["recovery_streak"] = self._recovery_solution_streak
+        self.log(f"[gen {generation}] block-population health: {block_health_text(health)}; "
+                 f"consecutive unhealthy checks {self._recovery_block_streak}")
+        self.log(f"[gen {generation}] recovery condition (NO_QUALITY_PROGRESS plus a diversity warning): "
+                 f"{'met' if qualifying else 'not met'}; consecutive {self._recovery_solution_streak}/"
+                 f"{config.recovery_consecutive_checks}")
+        if self._recovery_solution_streak >= config.recovery_consecutive_checks:
+            self._recovery_decision(generation, record, diversity_flags, health, finisher_summary)
+
+    def _recovery_decision(self, generation, record, diversity_flags, health, finisher_summary):
+        config = self.config
+        last = self._recovery_last_generation
+        if last is not None and generation + 1 - last < config.recovery_cooldown_generations:
+            self.log(f"[gen {generation}] recovery eligible but cooling down: {generation - last} completed "
+                     f"generations since the intervention in generation {last} "
+                     f"(cooldown {config.recovery_cooldown_generations})")
+            return
+        if generation >= config.generations:
+            return  # no generation left to build with recovery
+        if not config.mitm:
+            finisher = "finisher disabled"
+        elif finisher_summary is None:
+            finisher = f"not attempted ({self.finisher_skip_reason})"
+        else:
+            finisher = f"attempted: {finisher_summary['result']}"
+        if finisher_summary is not None and finisher_summary["result"] == "improved":
+            # A verified quality improvement is already in the population; recovery waits.
+            self.recovery_postponements += 1
+            self._recovery_solution_streak = 0
+            self.log(f"[gen {generation}] RECOVERY postponed: the finisher improved cube quality "
+                     f"(H {finisher_summary['initial_cost']} -> {finisher_summary['result_cost']})")
+            return
+        self.budget.check()  # never schedule recovery after an overall stop
+        refresh_limit = int(config.block_population * config.recovery_block_refresh_fraction)
+        refresh = False
+        if last is None:
+            block_note = "not considered (first intervention)"
+        elif self._quality() != self._recovery_quality_at_last:
+            block_note = "not considered (cube quality improved since the previous intervention)"
+        elif refresh_limit == 0:
+            block_note = "skipped (the block refresh fraction allows 0 blocks)"
+        elif not health["available"]:
+            block_note = f"skipped (block health {block_health_text(health)})"
+        elif self._recovery_block_streak < RECOVERY_BLOCK_CONSECUTIVE_CHECKS:
+            if health["unhealthy"]:
+                block_note = (f"skipped (unhealthy block evidence at {self._recovery_block_streak} of "
+                              f"{RECOVERY_BLOCK_CONSECUTIVE_CHECKS} required consecutive checks)")
+            else:
+                block_note = "skipped (block health acceptable)"
+        else:
+            refresh = True
+            block_note = None
+        self._recovery_pending = {
+            "scheduled_generation": generation,
+            "apply_generation": generation + 1,
+            "type": "solution plus partial block refresh" if refresh else "solution-only",
+            "refresh_blocks": refresh,
+            "block_refresh_limit": refresh_limit if refresh else 0,
+            "triggers": ["NO_QUALITY_PROGRESS"] + list(diversity_flags),
+            "streak": self._recovery_solution_streak,
+            "generations_without_quality_improvement": record["generations_without_quality_improvement"],
+            "finisher": finisher,
+            "block_health": health,
+            "block_note": block_note,
+            "before": diversity_summary_text(record),
+            "before_record": record,
+            "quality": self._quality(),
+            "seconds": 0.0,
+        }
+        self._recovery_quality_at_last = self._quality()
+        self._recovery_solution_streak = 0  # the evidence is used; a later intervention needs new checks
+        self.log(f"[gen {generation}] RECOVERY scheduled for generation {generation + 1} "
+                 f"({self._recovery_pending['type']}); finisher: {finisher}")
+
+    def recovery_solution_population(self, population, pending):
+        """Recovery generation: the usual elite copies and resets, recovery offspring in between.
+
+        The 60% offspring portion mixes fresh reduced sequences from the original cube, several
+        move variations of one parent, and two different blocks applied to one parent. Parents
+        cycle through the distinct verified endpoints of the usual parent pool in a shuffled
+        order, so no endpoint, the best included, is chosen twice before every other has been
+        chosen once. Each complete proposal is normalised once; a slot retries up to
+        RECOVERY_NOVELTY_RETRIES times while its normalised endpoint is already present, then
+        keeps its last valid proposal and counts as a uniqueness shortfall.
+        """
+        started = time.monotonic()
+        try:
+            return self._build_recovery_population(population, pending)
+        finally:  # interrupted, solved or completed, the work counts as recovery time
+            seconds = time.monotonic() - started
+            pending.setdefault("solution", {})["seconds"] = seconds
+            pending["seconds"] += seconds
+            self.recovery_seconds += seconds
+
+    def _build_recovery_population(self, population, pending):
+        rng = self.rng
+        ranked = sorted(population, key=_solution_sort_key)
+        count = len(ranked)
+        fifth = count // 5
+        next_population = [self.copy_solution(individual) for individual in ranked[:fifth]]
+        parents, parent_endpoints = [], set()
+        for individual in ranked[:count - fifth]:
+            if individual.endpoint not in parent_endpoints:
+                parent_endpoints.add(individual.endpoint)
+                parents.append(individual)
+        offspring_count = 3 * fifth
+        fresh = int(offspring_count * RECOVERY_FRESH_SHARE)
+        mutated = int(offspring_count * RECOVERY_MUTATION_SHARE)
+        combined = offspring_count - fresh - mutated
+        if not self._block_representatives:
+            mutated, combined = mutated + combined, 0
+        kinds = ["fresh"] * fresh + ["mutation"] * mutated + ["blocks"] * combined
+        seen = {individual.endpoint for individual in next_population}
+        seen.add(self.input_key)  # the empty reset slots
+        order = []
+
+        def next_parent():
+            if not order:
+                order.extend(range(len(parents)))
+                rng.shuffle(order)
+            return parents[order.pop()]
+
+        stats = {"elites": fifth, "resets": fifth, "offspring": offspring_count, "fresh": 0, "mutation": 0,
+                 "blocks": 0, "retries": 0, "shortfall": 0, "distinct_parents": len(parents)}
+        for kind in kinds:
+            for attempt in range(1 + RECOVERY_NOVELTY_RETRIES):
+                self.budget.check()
+                proposal, parent_ids, operator, block_id = self._recovery_proposal(kind, next_parent)
+                candidate = self.normalize_solution(proposal)
+                novel = candidate.endpoint not in seen
+                if novel or attempt == RECOVERY_NOVELTY_RETRIES:
+                    break
+                stats["retries"] += 1
+                self.offer_to_archive(candidate, uid=None, source=operator, block_id=block_id)
+            if not novel:
+                stats["shortfall"] += 1
+            child = self.make_solution(candidate, origin="recovery", operator=operator, parents=parent_ids,
+                                       block_id=block_id)
+            child.slot = "offspring"
+            self.offer_to_archive(candidate, uid=child.uid, source=operator, block_id=block_id)
+            seen.add(candidate.endpoint)
+            stats[kind] += 1
+            next_population.append(child)
+        next_population.extend(self.baseline_record("reset") for _ in range(fifth))
+        pending["solution"] = stats
+        return next_population
+
+    def _recovery_proposal(self, kind, next_parent):
+        """One complete raw proposal of a recovery kind; returns (proposal, parents, operator, block)."""
+        rng = self.rng
+        capacity = self.solution_capacity
+        if kind == "fresh":
+            low, high = min(RECOVERY_FRESH_MIN_MOVES, capacity), min(RECOVERY_FRESH_MAX_MOVES, capacity)
+            return generate_reduced_block(rng.randint(low, high), rng), (), "recovery-fresh", None
+        parent = next_parent()
+        if kind == "mutation":
+            sequence = parent.active
+            operations = rng.randint(RECOVERY_MUTATION_MIN_OPERATIONS, RECOVERY_MUTATION_MAX_OPERATIONS)
+            for _ in range(operations):
+                variation = (RECOVERY_MUTATION_VARIATIONS[rng.randrange(len(RECOVERY_MUTATION_VARIATIONS))]
+                             if sequence else "insert-moves")
+                if variation == "insert-moves":
+                    sequence = op_insert_moves(sequence, rng)
+                elif variation == "delete-gene":
+                    sequence = op_delete_gene(sequence, rng)
+                elif variation == "substitute-gene":
+                    sequence = op_substitute(sequence, rng)
+                else:
+                    sequence = op_span_replace(sequence, rng)
+            if len(sequence) > len(parent.active) + operations * MAX_PAYLOAD_LENGTH:
+                raise ConsistencyError("recovery mutation exceeded its proposal bound")
+            return sequence, (parent.uid,), f"recovery-mutation-x{operations}", None
+        representatives = self._block_representatives
+        first = rng.randrange(len(representatives))
+        proposal = op_insert_block(parent.active, representatives[first].active, rng)
+        if len(representatives) > 1:  # append a second, different block
+            second = rng.randrange(len(representatives) - 1)
+            second += second >= first
+            proposal += representatives[second].active
+        if len(proposal) > len(parent.active) + 2 * self.block_capacity:
+            raise ConsistencyError("recovery block combination exceeded its proposal bound")
+        return proposal, (parent.uid,), "recovery-blocks", representatives[first].uid
+
+    def _refresh_blocks(self, blocks, batch, pending):
+        """Escalated recovery: replace weak or redundant non-elite blocks, scored on ``batch``.
+
+        The top tenth (next generation's elite copies) is protected and the best-ranked block of
+        every improving transformation (one that lowers some context's cost) is kept. Removal
+        order: redundant blocks that improve no context, then redundant improving ones, then
+        distinct blocks that improve no context, the worst ranked first within each group.
+        Replacements alternate fresh and varied blocks under the usual capacity and duplicate
+        cap, preferring transformations not yet present.
+        """
+        started = time.monotonic()
+        try:
+            return self._replace_blocks(blocks, batch, pending)
+        finally:  # interrupted or not, the work counts as recovery time
+            seconds = time.monotonic() - started
+            pending.setdefault("blocks", {})["seconds"] = seconds
+            pending["seconds"] += seconds
+            self.recovery_seconds += seconds
+
+    def _replace_blocks(self, blocks, batch, pending):
+        rng = self.rng
+        count = len(blocks)
+        ranked = sorted(blocks, key=_block_sort_key)
+        protected = {id(block) for block in ranked[:count // 10]}
+        permutations, best_of = {}, {}
+        for block in ranked:
+            if block.active not in permutations:
+                permutations[block.active] = block_permutation(block.active)
+            best_of.setdefault(permutations[block.active], block)
+        removable = []
+        for position, block in enumerate(ranked):
+            redundant = best_of[permutations[block.active]] is not block
+            useful = bool(block.evaluation.improving_contexts)
+            if id(block) in protected or (useful and not redundant):
+                continue
+            group = 0 if redundant and not useful else 1 if redundant else 2
+            removable.append((group, -position, block))
+        removable.sort(key=lambda item: item[:2])
+        removed = [block for _, _, block in removable[:pending["block_refresh_limit"]]]
+        removed_ids = {id(block) for block in removed}
+        kept = [block for block in blocks if id(block) not in removed_ids]
+        counts = Counter(block.active for block in kept)
+        known = {permutations[block.active] for block in kept}
+        representatives = {}
+        for block in kept:
+            if block.active not in representatives or block.uid < representatives[block.active].uid:
+                representatives[block.active] = block
+        representatives = sorted(representatives.values(), key=lambda block: block.uid)
+        useful_regime = any(block.evaluation.useful for block in representatives)
+        replacements, retries = [], 0
+        for index in range(len(removed)):
+            for attempt in range(1 + RECOVERY_NOVELTY_RETRIES):
+                if index % 2 == 0 or not representatives:
+                    block = self.fresh_block(rng.randint(1, self.block_capacity), counts, origin="recovery",
+                                             operator="recovery-fresh")
+                else:
+                    block = self.block_offspring(representatives, useful_regime, counts)
+                    block.operator = f"recovery-{block.operator}"
+                permutation = block_permutation(block.active)
+                if permutation not in known or attempt == RECOVERY_NOVELTY_RETRIES:
+                    break
+                retries += 1
+                counts[block.active] -= 1
+                self._block_info.pop(block.uid, None)
+            block.origin = block.slot = "recovery"
+            self._block_info[block.uid] = ("recovery", block.operator, len(block.active))
+            known.add(permutation)
+            replacements.append(block)
+        self.evaluate_blocks(replacements, batch)
+        substitutes = iter(replacements)
+        refreshed = [next(substitutes) if id(block) in removed_ids else block for block in blocks]
+        before = measure_block_health(blocks, batch.serial)
+        after = measure_block_health(refreshed, batch.serial)
+        pending["blocks"] = {"refreshed": len(replacements), "limit": pending["block_refresh_limit"],
+                             "redundant": sum(1 for group, _, _ in removable[:len(removed)] if group < 2),
+                             "weak": sum(1 for group, _, _ in removable[:len(removed)] if group == 2),
+                             "retries": retries, "before": before, "after": after}
+        return refreshed
+
+    def _complete_recovery(self, pending, generation):
+        """Record and report an applied intervention after its generation was published."""
+        started = time.monotonic()
+        after = measure_population_diversity(self.population, self.config.solution_population)
+        self._recovery_pending = None
+        self._recovery_last_generation = generation
+        seconds = time.monotonic() - started
+        pending["seconds"] += seconds
+        self.recovery_seconds += seconds
+        pending["after"] = diversity_summary_text(after)
+        pending["after_record"] = after
+        self.recovery_records.append(pending)
+        solution = pending["solution"]
+        self.log(f"[gen {generation}] RECOVERY applied ({pending['type']}), scheduled at generation "
+                 f"{pending['scheduled_generation']} after {pending['streak']} consecutive qualifying checks: "
+                 f"{' + '.join(pending['triggers'])}; {pending['generations_without_quality_improvement']} "
+                 f"generations without better cube quality")
+        self.log(f"  finisher: {pending['finisher']}")
+        self.log(f"  solutions: {solution['elites']} elite copies kept, {solution['offspring']} recovery offspring "
+                 f"({solution['fresh']} fresh from the input cube, {solution['mutation']} multi-move mutations, "
+                 f"{solution['blocks']} block combinations; {solution['distinct_parents']} distinct parent endpoints), "
+                 f"{solution['resets']} empty resets; {solution['retries']} novelty retries, "
+                 + (f"{solution['shortfall']} offspring repeat an endpoint after the retry limit"
+                    if solution["shortfall"] else "no uniqueness shortfall"))
+        if pending["refresh_blocks"]:
+            blocks = pending["blocks"]
+            self.log(f"  blocks: refreshed {blocks['refreshed']} of at most {blocks['limit']} ({blocks['redundant']} "
+                     f"redundant, {blocks['weak']} improving no context; {blocks['retries']} novelty retries); "
+                     f"evidence at generation {pending['scheduled_generation']}: "
+                     f"{block_health_text(pending['block_health'])}")
+            self.log(f"  blocks on batch #{blocks['before']['batch']}: before {block_health_text(blocks['before'])}; "
+                     f"after {block_health_text(blocks['after'])}")
+        else:
+            self.log(f"  blocks: {pending['block_note']}")
+        self.log(f"  endpoint diversity before (generation {pending['scheduled_generation']} check): "
+                 f"{pending['before']}")
+        self.log(f"  endpoint diversity after publication: {pending['after']}")
+        self.log(f"  recovery time {pending['seconds']:.3f}s")
+
+    def recovery_report(self):
+        records = self.recovery_records
+        return {"enabled": self.config.adaptive_recovery, "interventions": len(records),
+                "solution_only": sum(1 for record in records if not record["refresh_blocks"]),
+                "with_block_refresh": sum(1 for record in records if record["refresh_blocks"]),
+                "postponed": self.recovery_postponements, "seconds": self.recovery_seconds,
+                "pending": self._recovery_pending is not None, "records": list(records)}
+
     # -- meet-in-the-middle finisher (optional, --mitm) ----------------------------------
 
     def finisher_attempt(self, generation):
@@ -3189,25 +3680,36 @@ class CoevolutionRun:
         """
         config = self.config
         entry = self.archive
-        if not config.mitm or entry.solved:
-            return None
-        if self._finisher_last_attempt is not None and generation - self._finisher_last_attempt < config.mitm_interval:
-            return None
-        remaining = config.mitm_total_seconds - self.finisher_seconds
-        if remaining <= 0:
-            return None
-        try:
-            corners, edges = misplaced_cubies(entry.endpoint)
-        except ValueError:
-            return None
-        if not (corners + edges <= config.mitm_trigger_cubies or (
+        skip = None
+        if not config.mitm:
+            skip = "finisher disabled"
+        elif entry.solved:
+            skip = "best-ever endpoint already solved"
+        elif self._finisher_last_attempt is not None and generation - self._finisher_last_attempt < config.mitm_interval:
+            skip = f"interval: last attempt at generation {self._finisher_last_attempt}"
+        elif config.mitm_total_seconds - self.finisher_seconds <= 0:
+            skip = "total finishing time spent"
+        if skip is None:
+            try:
+                corners, edges = misplaced_cubies(entry.endpoint)
+            except ValueError:
+                corners = edges = None
+                skip = "endpoint cubies not decodable"
+        if skip is None and not (corners + edges <= config.mitm_trigger_cubies or (
                 self.objective.state_function == "corners-first" and corners == 0
                 and edges <= config.mitm_corners_first_edge_trigger)):
+            skip = f"trigger not met: {corners} corners + {edges} edges misplaced"
+        cache_key = None if skip else (entry.endpoint, self.objective.identity, self.solution_capacity,
+                                       config.mitm_depth)
+        if skip is None:
+            previous = self._finisher_cache.get(cache_key)
+            if previous is not None and not previous["retryable"]:
+                # The same search on the same endpoint was already completed or timed out.
+                skip = f"endpoint already searched ({previous['termination']})"
+        self.finisher_skip_reason = skip
+        if skip is not None:
             return None
-        cache_key = (entry.endpoint, self.objective.identity, self.solution_capacity, config.mitm_depth)
-        previous = self._finisher_cache.get(cache_key)
-        if previous is not None and not previous["retryable"]:
-            return None  # the same search on the same endpoint was already completed or timed out
+        remaining = config.mitm_total_seconds - self.finisher_seconds
         self.budget.check()  # never start finishing work after an overall stop
         self._finisher_last_attempt = generation
         summary = {"generation": generation, "source": entry.source, "uid": entry.uid,
@@ -3477,6 +3979,7 @@ class CoevolutionRun:
             diversity_records=list(self.diversity_records),
             diversity_seconds=self.diversity_seconds,
             finisher_report=self.finisher_report(),
+            recovery_report=self.recovery_report(),
         )
 
     # -- reporting (section 11) ----------------------------------------------------------
@@ -3823,6 +4326,28 @@ def build_arg_parser():
                            help="warn after this many generations without better (unsolved, H) (default 100)")
     diversity.add_argument("--no-diversity-checks", action="store_true",
                            help="disable diversity measurements and warnings")
+    recovery = parser.add_argument_group(
+        "adaptive population recovery",
+        "Optional intervention, off by default, decided at the diversity checks: after enough consecutive "
+        "checks showing NO_QUALITY_PROGRESS together with a diversity warning, the next generation replaces "
+        "its 60% offspring portion with fresh, mutated and block-combination proposals (elite copies and "
+        "empty resets are kept). A later intervention without quality improvement since the previous one "
+        "may also refresh part of the block population, when the blocks were unhealthy at two consecutive "
+        "checks. The thresholds are experimental defaults.")
+    recovery.add_argument("--adaptive-recovery", action=argparse.BooleanOptionalAction, default=False,
+                          help="enable adaptive recovery (default: off; needs the diversity checks)")
+    recovery.add_argument("--recovery-consecutive-checks", type=int, default=DEFAULT_RECOVERY_CONSECUTIVE_CHECKS,
+                          help="consecutive qualifying health checks before an intervention "
+                               f"(default {DEFAULT_RECOVERY_CONSECUTIVE_CHECKS})")
+    recovery.add_argument("--recovery-cooldown-generations", type=int,
+                          default=DEFAULT_RECOVERY_COOLDOWN_GENERATIONS,
+                          help="minimum completed generations between interventions "
+                               f"(default {DEFAULT_RECOVERY_COOLDOWN_GENERATIONS})")
+    recovery.add_argument("--recovery-block-refresh-fraction", type=float,
+                          default=DEFAULT_RECOVERY_BLOCK_REFRESH_FRACTION,
+                          help="largest fraction of the block population an escalated intervention replaces, "
+                               f"0-{RECOVERY_MAX_BLOCK_REFRESH_FRACTION} "
+                               f"(default {DEFAULT_RECOVERY_BLOCK_REFRESH_FRACTION})")
     finisher = parser.add_argument_group(
         "meet-in-the-middle finisher",
         "Optional exact search from the best-ever candidate when few cubies are misplaced: a solved-side "
@@ -3884,6 +4409,10 @@ def config_from_args(args):
         mitm_attempt_seconds=args.mitm_attempt_seconds,
         mitm_total_seconds=args.mitm_total_seconds,
         mitm_cache=_resolve_mitm_cache(args),
+        adaptive_recovery=args.adaptive_recovery,
+        recovery_consecutive_checks=args.recovery_consecutive_checks,
+        recovery_cooldown_generations=args.recovery_cooldown_generations,
+        recovery_block_refresh_fraction=args.recovery_block_refresh_fraction,
     )
 
 
@@ -3957,6 +4486,14 @@ def _print_startup(config, objective, seed, seed_generated, input_cube):
               f"{config.mitm_cache or 'memory only'}")
     else:
         print("Finisher: disabled")
+    if config.adaptive_recovery:
+        print(f"Adaptive recovery: after {config.recovery_consecutive_checks} consecutive health checks with "
+              f"NO_QUALITY_PROGRESS plus a diversity warning, rebuild the next generation's offspring; cooldown "
+              f"{config.recovery_cooldown_generations} generations; a repeat without quality improvement may "
+              f"refresh up to {100 * config.recovery_block_refresh_fraction:g}% of the blocks after "
+              f"{RECOVERY_BLOCK_CONSECUTIVE_CHECKS} unhealthy block checks (experimental defaults)")
+    else:
+        print("Adaptive recovery: disabled")
 
 
 def _print_final(result, final, finalization_seconds):
@@ -3990,6 +4527,13 @@ def _print_final(result, final, finalization_seconds):
         print(f"Finisher: {len(attempts)} attempt(s), finishing time {report['seconds']:.2f}s "
               f"(table preparation {report['preparation_seconds']:.2f}s, "
               f"table {report['table_source'] or 'not prepared'})")
+    recovery = result.recovery_report
+    if recovery and recovery["enabled"]:
+        print(f"Adaptive recovery: {recovery['interventions']} intervention(s) ({recovery['solution_only']} "
+              f"solution-only, {recovery['with_block_refresh']} with block refresh), "
+              f"{recovery['postponed']} postponed after a finisher improvement; recovery time "
+              f"{recovery['seconds']:.3f}s" + ("; one scheduled intervention did not complete before the run ended"
+                                               if recovery["pending"] else ""))
     if final.problems:
         for problem in final.problems:
             print(f"CONSISTENCY ERROR: {problem}")
