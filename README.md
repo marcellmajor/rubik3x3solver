@@ -304,22 +304,34 @@ off nothing about the search changes.
   `--solution-capacity` can still fit. A solving path that stays too long is
   reported as such.
 - **Fallback:** when no solution is found, the finisher keeps up to 32
-  forward paths that strictly improve the selected fitness and uses the best one
-  that fits. These are only the forward half (at most `ceil(D/2)` moves). This is
-  not the best improvement among all `D`-move sequences.
+  forward paths that strictly improve the selected fitness and fit after
+  simplification, plus up to 8 that do not. All of them are joined, reduced and
+  normalised, and the best final result is used, so a path that only fits after
+  shortening can still win. These are only the forward half (at most
+  `ceil(D/2)` moves), so this is not the best improvement among all `D`-move
+  sequences.
 - **Results:** a solve ends the run through the normal verified-solve path. An
   improvement becomes the best-ever entry and replaces the worst-ranked
   offspring of the just-published population. Elite copies, resets and the
   population size stay the same. Results found right after setup wait for
   generation 1, so the all-NOOP initial population is never changed. The
   suffix is offered to the block library like any other improving block.
-- **Time:** each attempt's forward search gets `--mitm-attempt-seconds` (2).
-  All attempts together, including table preparation, get
-  `--mitm-total-seconds` (30). Finishing time also counts toward
-  `--time-limit` and stops on Ctrl+C. An attempt that runs out of time is
-  reported as "timed out", never as "more than `D` moves away". The finisher
-  never repeats an attempt on the same endpoint, except one whose table
-  preparation was cut short.
+- **Time:** each attempt's forward search and result processing get
+  `--mitm-attempt-seconds` (2). Table preparation (building or loading the
+  table, writing the cache, and the one-time shortening table) does not count
+  toward that limit. All attempts together, preparation included, get
+  `--mitm-total-seconds` (30). Every phase checks these limits, `--time-limit`
+  and Ctrl+C.
+  - When the attempt time runs out during result processing, the best result
+    processed so far is used. Only its final replay and insertion run after
+    the deadline.
+  - An overall stop discards an unsolved improvement but keeps a solve that
+    was already verified.
+  - An attempt that runs out of time is reported as "timed out", never as
+    "more than `D` moves away".
+  - The finisher never repeats an attempt on the same endpoint, except one
+    whose table preparation was cut short. A cache write that was cut short is
+    retried at the next preparation.
 - **Table cache:** the depth-5 table (621,649 states, about 12 MB on disk and
   about 200 MB in memory) takes about 1.5 s to build and 0.3 s to load. It is
   built only when the first attempt needs it and kept in memory for later

@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 import tempfile
+import time
 import unittest
 from collections import deque
 from unittest import mock
@@ -400,6 +401,28 @@ class DiskCacheTests(FinisherTestCase):
         self.assertTrue(table.complete)
         self.assertTrue(any("cannot write" in line for line in self.messages), self.messages)
 
+    def test_a_stopped_cache_write_leaves_nothing_and_is_retried(self):
+        s.prepare_solved_side_table(3, None)  # complete in memory, never written
+        with self.assertRaises(s._FinisherTimeout):
+            s.prepare_solved_side_table(3, self.cache, check=mock.Mock(side_effect=s._FinisherTimeout()))
+        self.assertFalse(os.path.exists(self.cache))  # no file, no temporary file, no directory
+        table = s.prepare_solved_side_table(3, self.cache)
+        self.assertEqual(table.source, "memory")
+        self.assertEqual(s.load_solved_side_table(self.cache, 3).entries, table.entries)
+        with mock.patch.object(s, "save_solved_side_table") as save:
+            s.prepare_solved_side_table(3, self.cache)
+        save.assert_not_called()  # written once per directory
+
+    def test_cache_files_are_deterministic_without_sorting(self):
+        s.prepare_solved_side_table(3, self.cache)
+        with open(self.path(), "rb") as handle:
+            first = handle.read()
+        s._SOLVED_SIDE_TABLES.clear()
+        shutil.rmtree(self.cache)
+        s.prepare_solved_side_table(3, self.cache)
+        with open(self.path(), "rb") as handle:
+            self.assertEqual(handle.read(), first)
+
     def test_memory_only_mode_writes_nothing(self):
         s.prepare_solved_side_table(2, None)
         self.assertFalse(os.path.exists(self.cache))
@@ -454,6 +477,103 @@ class RunFinisherTests(FinisherTestCase):
     def fabricated(self, solving=(), alternatives=(), over=(), termination="exhaustive"):
         return s.FinisherSearch(termination, 2, 2, 0, [s.parse_moves(p) for p in solving],
                                 [s.parse_moves(p) for p in alternatives], [s.parse_moves(p) for p in over], 0.0)
+
+    def blank_summary(self):
+        return {"termination": "exhaustive", "result": None, "suffix_length": None, "combined_before": None,
+                "combined_after": None, "result_cost": None, "result_solved": False, "archive": False,
+                "population": "-", "candidates": 0, "candidates_checked": 0, "processing": None}
+
+    def overshooting_run(self, capacity=4):
+        """Best-ever ``L3 B3 R1`` overshoots: a fitting path reaches H 150, an oversized one H 96."""
+        run = self.make_run(after(SOLVED, "R1 U1 C1 D1 B1 L1"), solution_capacity=capacity, block_capacity=2)
+        run.budget.start()
+        entry = self.set_archive(run, "L3 B3 R1")
+        self.assertEqual(entry.cost, 156)
+        return run, entry
+
+    def test_best_final_result_wins_across_fitting_and_oversized_paths(self):
+        run, entry = self.overshooting_run()
+        # "R3" fits at once (L3 B3, H 150); "R3 D3 C3" is 6 raw moves but reduces to 4 (H 96).
+        search = self.fabricated(alternatives=["R3"], over=["R3 D3 C3"])
+        with mock.patch.object(s, "mitm_search", return_value=search):
+            summary = run.finisher_attempt(0)
+        self.assertEqual(summary["result"], "improved")
+        self.assertEqual((run.archive.active, run.archive.cost), (s.parse_moves("L3 B3 D3 C3"), 96))
+        self.assertEqual((summary["combined_before"], summary["combined_after"]), (6, 4))
+        self.assertEqual((summary["candidates"], summary["candidates_checked"]), (2, 2))
+        replayed = s.state_key(s.replay(s.cube_from_key(run.input_key), run.archive.active))
+        self.assertEqual(run.objective.cost(replayed), 96)
+
+    def test_processing_stops_at_the_attempt_deadline_with_the_best_so_far(self):
+        run, entry = self.overshooting_run()
+        search = self.fabricated(alternatives=["R3", "R3 D3 C3"])
+        summary = self.blank_summary()
+        check = mock.Mock(side_effect=[None, s._FinisherTimeout()])
+        self.assertIsNone(run._finisher_apply(entry, search, summary, check))
+        self.assertEqual(summary["processing"], "stopped at the attempt deadline after 1 of 2 candidates")
+        self.assertEqual((summary["result"], run.archive.cost), ("improved", 150))
+        run, entry = self.overshooting_run()
+        summary = self.blank_summary()
+        run._finisher_apply(entry, search, summary, mock.Mock(side_effect=s._FinisherTimeout()))
+        self.assertIn("no usable result among the 0 candidates", summary["result"])
+        self.assertIs(run.archive, entry)
+        self.assertIn("result processing stopped", s.finisher_summary_line(dict(
+            summary, generation=1, source="x", uid=None, active_length=3, corners=0, edges=0, initial_cost=156,
+            depth=4, table_depth=2, forward_target=2, forward_depth=2, states=0, search_seconds=0.0,
+            preparation_seconds=0.0, table_source="memory")))
+
+    def test_an_overall_stop_keeps_only_a_verified_solve(self):
+        run = self.make_run(after(SOLVED, "R1 U1 C1"))
+        run.budget.start()
+        entry = self.set_archive(run, "C3 L1")
+        search = self.fabricated(solving=["L3 U3 R3"], alternatives=["L3"])
+        stop = mock.Mock(side_effect=[None, s.SearchInterrupted("SIGINT received")])
+        candidate, suffix = run._finisher_apply(entry, search, self.blank_summary(), stop)
+        self.assertTrue(candidate.solved)
+        run, entry = self.overshooting_run()
+        stop = mock.Mock(side_effect=[None, s.SearchInterrupted("SIGINT received")])
+        with self.assertRaises(s.SearchInterrupted):
+            run._finisher_apply(entry, self.fabricated(alternatives=["R3", "R3 D3 C3"]), self.blank_summary(), stop)
+        self.assertIs(run.archive, entry)  # an unsolved improvement is dropped after an overall stop
+
+    def test_attempt_time_excludes_preparation_but_covers_processing(self):
+        run = self.make_run(after(SOLVED, self.FAR), mitm_attempt_seconds=0.2)
+        run.budget.start()
+        table = self.table(2)
+        seen = {}
+
+        def slow_preparation(*args, **kwargs):
+            time.sleep(0.3)
+            return table
+
+        def slow_search(*args, deadline=None, **kwargs):
+            seen["left"] = deadline - time.monotonic()
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.01)
+            return self.fabricated(alternatives=["R3"])
+
+        with mock.patch.object(s, "prepare_solved_side_table", side_effect=slow_preparation), \
+                mock.patch.object(s, "mitm_search", side_effect=slow_search):
+            summary = run.finisher_attempt(0)
+        self.assertGreater(summary["preparation_seconds"], 0.3)
+        self.assertGreater(seen["left"], 0.1)  # 0.3 s of preparation did not use up the 0.2 s attempt
+        self.assertEqual(summary["processing"], "stopped at the attempt deadline after 0 of 1 candidates")
+        self.assertEqual(run.archive.source, "empty baseline")
+
+    def test_shortening_table_is_built_during_preparation(self):
+        saved = s._SHORTEN_INDEX
+        try:
+            s._SHORTEN_INDEX = None
+            with self.assertRaises(s._FinisherTimeout):
+                s._shorten_index(mock.Mock(side_effect=[None] * 10 + [s._FinisherTimeout()]))
+            self.assertIsNone(s._SHORTEN_INDEX)  # nothing is kept from a stopped build
+            run = self.make_run(after(SOLVED, self.FAR))
+            run.budget.start()
+            with mock.patch.object(s, "mitm_search", return_value=self.fabricated()):
+                run.finisher_attempt(0)
+            self.assertIsNotNone(s._SHORTEN_INDEX)
+        finally:
+            if s._SHORTEN_INDEX is None:
+                s._SHORTEN_INDEX = saved
 
     def test_solving_path_still_over_capacity_is_reported(self):
         run = self.make_run(after(SOLVED, "R1 U1 C1"), solution_capacity=2, block_capacity=2)

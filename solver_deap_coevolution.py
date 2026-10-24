@@ -2230,6 +2230,7 @@ class SolvedSideTable:
         self.entries = {_MITM_SOLVED_CODE: 0}
         self.complete = depth == 0
         self.source = "built"
+        self.saved_to = set()  # cache directories written (or found unwritable) for this table
         self._level = 0
         self._frontier = [(_MITM_SOLVED, 0)]
         self._next = []
@@ -2279,18 +2280,30 @@ class SolvedSideTable:
         return tuple(moves)
 
 
-def save_solved_side_table(table, directory):
-    """Write a complete table atomically: a JSON header line, then sorted 19-byte records."""
+def save_solved_side_table(table, directory, check=None):
+    """Write a complete table atomically: a JSON header line, then 19-byte records.
+
+    Records follow the table's own order, breadth-first for a built table, so the file is
+    deterministic without a sort. ``check`` may raise while the records are serialised (about
+    0.5 s at depth 5); nothing is written then, and the bounded atomic write follows.
+    """
     if not table.complete:
         raise ConsistencyError("an incomplete solved-side table must not be cached")
-    body = b"".join(code.to_bytes(MITM_CODE_BYTES, "big") + bytes((value,))
-                    for code, value in sorted(table.entries.items()))
+    parts = []
+    for index, (code, value) in enumerate(table.entries.items()):
+        if check is not None and index % 8192 == 0:
+            check()
+        parts.append(code.to_bytes(MITM_CODE_BYTES, "big") + bytes((value,)))
+    body = b"".join(parts)
+    if check is not None:
+        check()
     header = json.dumps({"format": MITM_CACHE_FORMAT, "version": MITM_CACHE_VERSION,
                          "fingerprint": _mitm_fingerprint(table.depth), "depth": table.depth,
                          "entries": len(table.entries), "body_sha256": hashlib.sha256(body).hexdigest()},
                         sort_keys=True).encode("utf-8")
     os.makedirs(directory, exist_ok=True)
     _atomic_write_bytes(mitm_cache_file(directory, table.depth), header + b"\n" + body, prefix=".mitm_")
+    table.saved_to.add(directory)
 
 
 def load_solved_side_table(directory, depth, check=None):
@@ -2343,6 +2356,7 @@ def load_solved_side_table(directory, depth, check=None):
                 raise ValueError("the cached table's move links do not match the move model")
     table = SolvedSideTable(depth)
     table.entries, table.complete, table.source, table._frontier = entries, True, "disk cache", []
+    table.saved_to.add(directory)
     return table
 
 
@@ -2350,8 +2364,9 @@ def prepare_solved_side_table(depth, directory, check=None, report=None):
     """Complete table from memory, the disk cache or a (resumable) build. ``check`` may raise to stop."""
     table = _SOLVED_SIDE_TABLES.get(depth)
     if table is not None and table.complete:
-        if table.source != "memory":
-            table.source = "memory"
+        if directory is not None and directory not in table.saved_to:
+            _save_solved_side_table_once(table, directory, check, report)  # e.g. after a stopped save
+        table.source = "memory"
         return table
     if table is None:
         if directory is not None:
@@ -2367,13 +2382,19 @@ def prepare_solved_side_table(depth, directory, check=None, report=None):
         table = _SOLVED_SIDE_TABLES[depth] = SolvedSideTable(depth)
     table.extend(check)
     if directory is not None:
-        try:
-            save_solved_side_table(table, directory)
-        except OSError as exc:
-            if report is not None:
-                report(f"Finisher cache: cannot write {mitm_cache_file(directory, depth)} "
-                       f"({exc.strerror or exc}); the table stays in memory")
+        _save_solved_side_table_once(table, directory, check, report)
     return table
+
+
+def _save_solved_side_table_once(table, directory, check, report):
+    """Save, or report an unwritable cache once; a stopped save is retried by the next preparation."""
+    try:
+        save_solved_side_table(table, directory, check)
+    except OSError as exc:
+        table.saved_to.add(directory)
+        if report is not None:
+            report(f"Finisher cache: cannot write {mitm_cache_file(directory, table.depth)} "
+                   f"({exc.strerror or exc}); the table stays in memory")
 
 
 @dataclass
@@ -2492,6 +2513,8 @@ def finisher_summary_line(summary):
         line += (f" | suffix {summary['suffix_length']} moves, combined {summary['combined_before']} -> "
                  f"{summary['combined_after']} moves, H={summary['result_cost']} "
                  f"solved={'yes' if summary['result_solved'] else 'no'}")
+    if summary.get("processing"):
+        line += f" | result processing {summary['processing']}"
     line += f" | archive {'yes' if summary['archive'] else 'no'}, population {summary['population']}"
     if summary["preparation_seconds"] >= 0.005:
         line += f" | table {summary['table_source'] or 'not ready'} {summary['preparation_seconds']:.2f}s"
@@ -3719,7 +3742,7 @@ class CoevolutionRun:
                    "termination": None, "result": None, "suffix_length": None, "combined_before": None,
                    "combined_after": None, "result_cost": None, "result_solved": False, "archive": False,
                    "population": "-", "preparation_seconds": 0.0, "table_source": None, "search_seconds": 0.0,
-                   "seconds": 0.0}
+                   "candidates": 0, "candidates_checked": 0, "processing": None, "seconds": 0.0}
         started = time.monotonic()
         allowance_end = started + remaining
 
@@ -3733,6 +3756,7 @@ class CoevolutionRun:
             try:
                 table = prepare_solved_side_table(config.mitm_depth // 2, config.mitm_cache, check_allowance,
                                                   self.log)
+                _shorten_index(check_allowance)  # used when joining results; built once, outside the attempt time
             except _FinisherTimeout:
                 summary.update(termination="preparation incomplete", result="no attempt (table not ready)")
                 return summary
@@ -3741,13 +3765,20 @@ class CoevolutionRun:
                 summary["preparation_seconds"] = prepared
                 self.finisher_preparation_seconds += prepared
             summary["table_source"] = self.finisher_table_source = table.source
+            # The attempt time covers the forward search and result processing; table
+            # preparation above counts only toward the total finishing time.
             deadline = min(time.monotonic() + config.mitm_attempt_seconds, allowance_end)
+
+            def check_deadline():
+                self.budget.check()
+                if time.monotonic() >= deadline:
+                    raise _FinisherTimeout()
+
             search = mitm_search(entry.endpoint, table, config.mitm_depth, self.objective.cost, entry.active,
                                  self.solution_capacity, check=self.budget.check, deadline=deadline)
             summary.update(termination=search.termination, forward_depth=search.forward_depth,
                            states=search.states, search_seconds=search.seconds)
-            self.budget.check()  # verify a result only while the run still has time
-            solved_candidate = self._finisher_apply(entry, search, summary)
+            solved_candidate = self._finisher_apply(entry, search, summary, check_deadline)
             return summary
         except SearchStopped:
             summary.update(termination="stopped by the run's budget or SIGINT", result="abandoned")
@@ -3766,32 +3797,47 @@ class CoevolutionRun:
         proposal = tuple(entry.active) + tuple(suffix)
         return proposal, shorten_sequence(self._remove_state_loops(simplify(proposal)))
 
-    def _finisher_apply(self, entry, search, summary):
-        """Verify the best usable result; returns a solved candidate for the caller to archive, else None."""
+    def _finisher_apply(self, entry, search, summary, check):
+        """Use the best verified result; returns a solved candidate for the caller to archive, else None.
+
+        Every retained solving and fallback path is joined, reduced and normalised, and the best
+        final rank wins, so a path that fits only after shortening can beat one that fitted at
+        once. ``check`` runs before each candidate: at the attempt deadline the best candidate
+        processed so far is used (its archive replay and insertion are the bounded final step).
+        An overall stop discards an unsolved improvement but never an already verified solve.
+        """
         capacity = self.solution_capacity
+        candidates = ([(True, suffix) for suffix in search.solving]
+                      + [(False, suffix) for suffix in search.alternatives + search.over_capacity])
+        summary["candidates"] = len(candidates)
+        best = None  # (rank, order, candidate, suffix, proposal)
         solving_over_capacity = False
-        for suffix in search.solving:
-            proposal, reduced = self._finisher_reduce(entry, suffix)
-            if len(reduced) > capacity:
-                solving_over_capacity = True
-                continue
-            candidate = self.normalize_solution(reduced, check_budget=False)
+        try:
+            for order, (solving, suffix) in enumerate(candidates):
+                check()
+                summary["candidates_checked"] = order + 1
+                proposal, reduced = self._finisher_reduce(entry, suffix)
+                if len(reduced) > capacity:
+                    solving_over_capacity = solving_over_capacity or solving
+                    continue
+                candidate = self.normalize_solution(reduced, check_budget=False)
+                if (0 if candidate.solved else 1, candidate.cost) >= (1, entry.cost):
+                    continue  # only a strict improvement in the selected fitness is usable
+                if best is None or (candidate.rank, order) < best[:2]:
+                    best = (candidate.rank, order, candidate, suffix, proposal)
+        except _FinisherTimeout:
+            summary["processing"] = (f"stopped at the attempt deadline after {summary['candidates_checked']} "
+                                     f"of {len(candidates)} candidates")
+        except SearchStopped:
+            if best is None or not best[2].solved:
+                raise
+        if best is not None:
+            _, _, candidate, suffix, proposal = best
+            summary.update(suffix_length=len(suffix), combined_before=len(proposal),
+                           combined_after=len(candidate.active), result_cost=candidate.cost,
+                           result_solved=candidate.solved)
             if candidate.solved:
-                summary.update(result="solved", suffix_length=len(suffix), combined_before=len(proposal),
-                               combined_after=len(candidate.active), result_cost=candidate.cost, result_solved=True,
-                               archive=True, population="solve ends the run")
-                return candidate, suffix
-        for suffix in search.alternatives + search.over_capacity:
-            proposal, reduced = self._finisher_reduce(entry, suffix)
-            if len(reduced) > capacity:
-                continue
-            candidate = self.normalize_solution(reduced, check_budget=False)
-            if (0 if candidate.solved else 1, candidate.cost) >= (1, entry.cost):
-                continue  # only a strict improvement in the selected fitness is usable
-            if candidate.solved:
-                summary.update(result="solved", suffix_length=len(suffix), combined_before=len(proposal),
-                               combined_after=len(candidate.active), result_cost=candidate.cost,
-                               result_solved=True, archive=True, population="solve ends the run")
+                summary.update(result="solved", archive=True, population="solve ends the run")
                 return candidate, suffix
             record = self.make_solution(candidate, origin="finisher", operator=f"mitm-depth{self.config.mitm_depth}")
             record.slot = "offspring"
@@ -3799,12 +3845,14 @@ class CoevolutionRun:
                                              block_payload=suffix)
             self._finisher_queue.append(record)
             inserted = self._insert_finisher_records()
-            summary.update(result="improved", suffix_length=len(suffix), combined_before=len(proposal),
-                           combined_after=len(candidate.active), result_cost=candidate.cost, archive=archived,
+            summary.update(result="improved", archive=archived,
                            population=(f"replaced offspring S#{inserted[0][1].uid}" if inserted
                                        else "queued for generation 1's offspring"))
             return None
-        if solving_over_capacity:
+        if summary["processing"] is not None:
+            summary["result"] = (f"no usable result among the {summary['candidates_checked']} candidates processed "
+                                 "before the attempt deadline")
+        elif solving_over_capacity:
             summary["result"] = "solving path exceeds the solution capacity after reductions"
         elif search.solving:
             summary["result"] = "solving path not verified"
@@ -4163,13 +4211,16 @@ def run_search(config, input_cube=None, *, budget=None, log=None):
 _SHORTEN_INDEX = None
 
 
-def _shorten_index():
-    """Permutation -> shortest canonical sequence of at most four moves, built lazily once."""
+def _shorten_index(check=None):
+    """Permutation -> shortest canonical sequence of at most four moves, built lazily once.
+
+    ``check`` may raise to stop a build (about 0.1 s); nothing is kept until it completes.
+    """
     global _SHORTEN_INDEX
     if _SHORTEN_INDEX is None:
         index = {}
         for length in range(5):
-            for candidate in iter_canonical_sequences(length):
+            for candidate in iter_canonical_sequences(length, check=check):
                 index.setdefault(bytes(block_permutation(candidate)), candidate)
         _SHORTEN_INDEX = index
     return _SHORTEN_INDEX
