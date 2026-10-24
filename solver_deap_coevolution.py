@@ -68,11 +68,11 @@ from cube import Cube
 # ---------------------------------------------------------------------------
 
 DEFAULT_FITNESS = "manhattan"
-DEFAULT_SOLUTION_POPULATION = 1000
-DEFAULT_BLOCK_POPULATION = 500
-DEFAULT_SOLUTION_CAPACITY = 64
-DEFAULT_BLOCK_CAPACITY = 24
-DEFAULT_CONTEXT_COUNT = 16
+DEFAULT_SOLUTION_POPULATION = 100000
+DEFAULT_BLOCK_POPULATION = 30000
+DEFAULT_SOLUTION_CAPACITY = 72
+DEFAULT_BLOCK_CAPACITY = 64
+DEFAULT_CONTEXT_COUNT = 32
 DEFAULT_GENERATIONS = 10000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
 DEFAULT_LOG_EVERY = 10
@@ -87,9 +87,9 @@ DEFAULT_DIVERSITY_MIN_CUBIE_DISTANCE = 2.0
 DEFAULT_STAGNATION_GENERATIONS = 100
 
 FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie", "edges",
-                   "cubie-refined", "grouped-cubie")
+                   "cubie-refined", "grouped-cubie", "corners-first")
 INTEGER_VALUED_FITNESS = ("manhattan", "manhattan-min", "misplaced", "cubie", "edges", "cubie-refined",
-                        "grouped-cubie")
+                          "corners-first", "grouped-cubie")
 
 # Ordinary solution-offspring operators and their probabilities (section 7.5).
 SOLUTION_OPERATOR_PROBABILITIES = (
@@ -349,11 +349,16 @@ def default_input_cube():
     The spec's original checkpoint from ``solver_deap.py`` is kept in
     ``benchmark_coevolution.CHECKPOINT_KEY``.
     """
+    #return Cube(
+    #                               "WYRYGRGRY",
+    #    ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"],
+    #                               "WGWRBBGWR",
+    #)
     return Cube(
-                                   "WYRYGRGRY",
-        ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"],
-                                   "WGWRBBGWR",
-    )
+                                    "GGGYGWGGG",
+        [ "RORRRRRRR",  "WGWWWWWWW",  "OROOOOOOO",  "YGYYYYYYY", ],
+                                    "BBBBBBBBB"
+    )    
 
 
 def validate_input_cube(cube):
@@ -499,6 +504,51 @@ def validate_cubie_input(key):
         raise InvalidInputError("the stickers repeat a cubie, so they are not a consistent set of cubies")
 
 
+def _cubie_distances(key):
+    """(corner, edge) sums of the per-cubie distances that make up ``cubie_cost``."""
+    faces = _face_indices(key)
+    corner_total = edge_total = 0
+    try:
+        for slot, (getter, distances) in zip(_CUBIE_SLOTS, _CUBIE_TABLES):
+            if len(slot) == 3:
+                corner_total += distances["".join(getter(faces))]
+            else:
+                edge_total += distances["".join(getter(faces))]
+    except KeyError:
+        raise ValueError("the stickers do not form a consistent set of cubies") from None
+    return corner_total, edge_total
+
+
+def corner_cubie_distance(key):
+    """Sum over the 8 corners of each one's move distance to its home slot and orientation."""
+    return _cubie_distances(key)[0]
+
+
+def edge_cubie_distance(key):
+    """Sum over the 12 edges of each one's move distance to its home slot and orientation."""
+    return _cubie_distances(key)[1]
+
+
+# One corner unit must outweigh every possible edge total, so corners stay
+# strictly primary: the largest achievable edge distance sum, plus one.
+_MAX_EDGE_CUBIE_DISTANCE = sum(max(distances.values())
+                               for slot, (_, distances) in zip(_CUBIE_SLOTS, _CUBIE_TABLES)
+                               if len(slot) == 2)
+CORNERS_FIRST_EDGE_SCALE = _MAX_EDGE_CUBIE_DISTANCE + 1
+
+
+def corners_first_cost(key):
+    """Staged cost: corners home first (slot and orientation), then edges.
+
+    The edge distance only breaks through once the corner distance is zero,
+    and any corner regression outweighs every possible edge gain, so the
+    cost reverts to rewarding corners alone. Stateless and pure, like every
+    other objective: ``SCALE * corner_distance + edge_distance``.
+    """
+    corner_total, edge_total = _cubie_distances(key)
+    return CORNERS_FIRST_EDGE_SCALE * corner_total + edge_total
+
+
 # The 20 blocks around the centres (8 corners, 12 edges): each block's stickers paired with their face centres.
 _BLOCK_STICKER_CENTRES = tuple(tuple((position, (position // 9) * 9 + 4) for position in slot)
                                for slot in _CUBIE_SLOTS)
@@ -581,6 +631,8 @@ class Objective:
             return cubie_refined_cost(key)
         if self.state_function == "grouped-cubie":
             return grouped_cubie_cost(key)
+        if self.state_function == "corners-first":
+            return corners_first_cost(key)
         if self.state_function == "edges":
             return edge_cost(key)
         value = self.manhattan_weight * manhattan_cost(key) + self.misplaced_weight * misplaced_cost(key)
@@ -602,6 +654,10 @@ class Objective:
         if self.state_function == "grouped-cubie":
             return (f"{self.name}: joint four-piece distances, then cubie, then misplaced "
                     "(4096 * pattern sum + 64 * cubie + misplaced; not a length lower bound)")
+        if self.state_function == "corners-first":
+            return (f"{self.name}: corner cubie distance first (slot and orientation), "
+                    f"then edge cubie distance ({CORNERS_FIRST_EDGE_SCALE} * corners + edges; "
+                    "edges count only once corners are home, and any corner regression dominates again)")
         if self.state_function == "edges":
             return (f"{self.name}: blocks around the centres (8 corners, 12 edges) "
                     "not showing all their correct colours")
@@ -619,7 +675,7 @@ def make_objective(name, manhattan_weight=None, misplaced_weight=None):
             raise ConfigError("--manhattan-weight/--misplaced-weight are valid only with "
                               "--fitness manhattan-misplaced")
         return Objective(name, name if name in ("misplaced", "cubie", "edges", "cubie-refined",
-                                               "grouped-cubie") else "manhattan")
+                                               "grouped-cubie", "corners-first") else "manhattan")
     weights = []
     for label, value, default in (
         ("manhattan", manhattan_weight, DEFAULT_MANHATTAN_WEIGHT),
@@ -1999,7 +2055,7 @@ class CoevolutionRun:
         self.history = tools.Logbook()
 
         self._last_report_marker = None
-        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie"):
+        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie", "corners-first"):
             validate_cubie_input(input_key)
         baseline = self.normalize_solution((), check_budget=False)
         self.baseline = baseline
@@ -2118,6 +2174,37 @@ class CoevolutionRun:
                 best_infeasible = rank
         return best, best_rank, best_infeasible
 
+    def _remove_state_loops(self, sequence):
+        """Delete moves between two visits to the same state, then re-reduce.
+
+        Cutting a loop between equal states (all candidates start from the
+        original cube) preserves the final state, and simplification after a
+        cut preserves the permutation, so the endpoint, cost and solved flag
+        are unchanged; ``_verify_candidate`` still replays the result.
+        """
+        sequence = tuple(sequence)
+        for _ in range(len(sequence) + 1):
+            seen = {self.input_key: 0}
+            states = [self.input_key]
+            kept = []
+            key = self.input_key
+            for allele in sequence:
+                key = apply_move_to_key(key, allele, self.counters)
+                if key in seen:
+                    start = seen[key]
+                    kept = kept[:start]
+                    states = states[:start + 1]
+                    seen = {state: index for index, state in enumerate(states)}
+                else:
+                    kept.append(allele)
+                    states.append(key)
+                    seen[key] = len(kept)
+            shortened = simplify(tuple(kept))
+            if shortened == sequence:
+                return sequence
+            sequence = shortened
+        raise ConsistencyError("state-loop removal did not stabilise")
+
     def normalize_solution(self, proposal, *, check_budget=True):
         """Best simplified prefix of a complete proposal, verified by independent replay."""
         moves = active_moves(proposal)
@@ -2134,6 +2221,7 @@ class CoevolutionRun:
             (k, key, cost, solved), rank, _ = self._best_prefix(sequence, check_budget)
         else:
             raise ConsistencyError("solution normalisation did not stabilise")
+        chosen = self._remove_state_loops(chosen)
         candidate = NormalizedCandidate(chosen, key, cost, solved, capacity_rejected)
         self._verify_candidate(candidate)
         if capacity_rejected:
@@ -2990,6 +3078,50 @@ def run_search(config, input_cube=None, *, budget=None, log=None):
     return result
 
 
+_SHORTEN_INDEX = None
+
+
+def _shorten_index():
+    """Permutation -> shortest canonical sequence of at most four moves, built lazily once."""
+    global _SHORTEN_INDEX
+    if _SHORTEN_INDEX is None:
+        index = {}
+        for length in range(5):
+            for candidate in iter_canonical_sequences(length):
+                index.setdefault(bytes(block_permutation(candidate)), candidate)
+        _SHORTEN_INDEX = index
+    return _SHORTEN_INDEX
+
+
+def shorten_sequence(sequence):
+    """Shorten by window replacement: same permutation, never a longer result.
+
+    Any contiguous window whose permutation equals a canonical sequence of
+    at most four moves is replaced by that sequence, re-reducing after each
+    splice, until no window improves. Deterministic and purely a function
+    of the sequence's permutation, so the end state from any start is kept.
+    This is a reporting-time polish, deliberately not used per candidate.
+    """
+    moves = simplify(sequence)
+    if len(moves) <= 4:
+        return moves
+    index = _shorten_index()
+    while True:
+        hit = None
+        for width in range(len(moves), 4, -1):
+            for start in range(len(moves) - width + 1):
+                replacement = index.get(bytes(block_permutation(moves[start:start + width])))
+                if replacement is not None and len(replacement) < width:
+                    hit = (start, width, replacement)
+                    break
+            if hit is not None:
+                break
+        if hit is None:
+            return moves
+        start, width, replacement = hit
+        moves = simplify(moves[:start] + replacement + moves[start + width:])
+
+
 def finalize_result(result):
     """Replay only the archived active moves from a fresh original and compare metadata."""
     entry = result.archive
@@ -3004,6 +3136,9 @@ def finalize_result(result):
         problems.append("archived active moves are not reduced")
     if len(moves) > result.solution_capacity:
         problems.append("archived active moves exceed the solution capacity")
+    # Report a window-shortened equivalent; the replay below still compares
+    # its endpoint, cost and solved flag against the archived metadata.
+    moves = shorten_sequence(moves)
     cube = replay(cube_from_key(result.input_key), moves)
     key = state_key(cube)
     cost = result.objective.cost(key)
@@ -3309,7 +3444,7 @@ def main(argv=None, *, clock=None):
         objective = validate_config(config)
         input_cube = default_input_cube()
         input_key = validate_input_cube(input_cube)
-        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie"):
+        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie", "corners-first"):
             validate_cubie_input(input_key)
     except (ConfigError, InvalidInputError) as exc:
         _print_status(STATUS_INVALID_INPUT, f"Invalid configuration or input: {exc}")

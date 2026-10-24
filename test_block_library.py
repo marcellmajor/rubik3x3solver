@@ -79,10 +79,11 @@ REFERENCE_PANEL = (
     "BGBYGRYOWRROORBYWGWGROWRWRYGYOWOBROYGBWYYWBWGBGOYBGRBO",
 )
 
-# Search fingerprints recorded with the pre-feature code (section 10.7).
+# Search fingerprints for the library-disabled search (section 10.7);
+# re-recorded after candidate state-loop removal changed stored actives.
 PRE_FEATURE_DIGESTS = {
-    "manhattan": "965b8deb03c840aa1959fe4ac52ff3f3cdb527fee7d0c38ce67efc1046a36db6",
-    "grouped-cubie": "3b911a171df71311157f953f8c131396ce171fd44ff502dc8adcee4cb824e816",
+    "manhattan": "7d6d332531a99cabdcb18079b4fdb6eabe4fd0cb69069f52d675e9f5e410f0b7",
+    "grouped-cubie": "aa9fddf4ec607a55081dde80930d8faa2b7182d431e3f94e595d38b55f8c5732",
 }
 
 

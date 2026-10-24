@@ -172,6 +172,33 @@ class SimplifierTests(unittest.TestCase):
 
 
 class NormalizationTests(unittest.TestCase):
+    def test_state_loop_removal_preserves_endpoint(self):
+        run = make_run(scrambled("R1 U1 C1"))
+        loop = s.parse_moves("R1 C1")
+        sequence = loop + s.cube_inverse(loop) + s.parse_moves("U1")
+        self.assertEqual(run._remove_state_loops(sequence), s.parse_moves("U1"))
+        rng = random.Random(23)
+        for _ in range(100):
+            proposal = tuple(rng.randrange(19) for _ in range(rng.randint(0, 30)))
+            candidate = run.normalize_solution(proposal)
+            self.assertEqual(key_after(run.input_key, candidate.active), candidate.endpoint)
+            self.assertLessEqual(len(candidate.active), len(s.active_moves(proposal)))
+
+    def test_shorten_sequence_keeps_the_permutation(self):
+        sequence = s.parse_moves(
+            "C1 R2 U1 R1 L1 C3 L3 B2 D3 C2 D3 R2 C1 R3 B1 R2 D1 B2 L2 B2 R2 C2 R2 B2 R2 "
+            "L2 C2 R2 L2 C1 B2 U2 D2 C2 B1 U2 B2 L2 C2 B2 R2 C2 B2 U2 B2")
+        shortened = s.shorten_sequence(sequence)
+        self.assertLess(len(shortened), len(sequence))
+        self.assertEqual(s.block_permutation(shortened), s.block_permutation(sequence))
+        self.assertEqual(s.shorten_sequence(shortened), shortened)
+        rng = random.Random(29)
+        for _ in range(100):
+            proposal = tuple(rng.randrange(19) for _ in range(rng.randint(0, 30)))
+            result = s.shorten_sequence(proposal)
+            self.assertLessEqual(len(result), len(s.simplify(proposal)))
+            self.assertEqual(s.block_permutation(result), s.block_permutation(s.active_moves(proposal)))
+
     def test_empty_baseline_has_length_zero(self):
         run = make_run()
         self.assertEqual(run.baseline.active, ())
@@ -355,6 +382,37 @@ class ObjectiveTests(unittest.TestCase):
         self.assertEqual([s.cubie_refined_cost(key) for key in by_refined],
                          [s.cubie_refined_cost(key) for key in by_tiers])
 
+    def test_corners_first_cost_properties(self):
+        staged = s.make_objective("corners-first")
+        self.assertEqual((staged.state_function, staged.integer_valued), ("corners-first", True))
+        args = s.build_arg_parser().parse_args(["--fitness", "corners-first"])
+        self.assertEqual(s.validate_config(s.config_from_args(args)).state_function, "corners-first")
+        self.assertEqual(s.corners_first_cost(SOLVED_KEY), 0)
+        # The scale is derived from the tables: one corner unit outweighs
+        # every achievable edge total, so corners can never be traded for edges.
+        self.assertEqual(s.CORNERS_FIRST_EDGE_SCALE, s._MAX_EDGE_CUBIE_DISTANCE + 1)
+        rng = random.Random(13)
+        keys = [key_after(SOLVED_KEY, s.generate_reduced_block(rng.randint(1, 20), rng))
+                for _ in range(200)]
+        for key in keys:
+            corners, edges = s.corner_cubie_distance(key), s.edge_cubie_distance(key)
+            self.assertEqual(corners + edges, s.cubie_cost(key))
+            self.assertEqual(s.corners_first_cost(key), s.CORNERS_FIRST_EDGE_SCALE * corners + edges)
+            self.assertEqual(s.corners_first_cost(key) == 0, s.is_solved_key(key))
+        # Exactly lexicographic in (corner distance, edge distance): sorting
+        # by the staged cost is sorting by corners first, edges second.
+        by_staged = [s.corners_first_cost(key) for key in sorted(keys, key=s.corners_first_cost)]
+        by_tiers = [s.corners_first_cost(key) for key in
+                    sorted(keys, key=lambda key: (s.corner_cubie_distance(key), s.edge_cubie_distance(key)))]
+        self.assertEqual(by_staged, by_tiers)
+        # Phase behaviour: with corners home the edge distance decides; any
+        # single corner regression outweighs even the worst edge total.
+        corners_home = [key for key in keys if s.corner_cubie_distance(key) == 0 and s.edge_cubie_distance(key) > 0]
+        if corners_home:
+            key = corners_home[0]
+            self.assertEqual(s.corners_first_cost(key), s.edge_cubie_distance(key))
+            self.assertLess(s.corners_first_cost(key), s.CORNERS_FIRST_EDGE_SCALE)
+
     def test_cubie_fitness_rejects_inconsistent_cubies(self):
         stickers = list(SOLVED_KEY)
         stickers[0], stickers[10] = stickers[10], stickers[0]  # a corner sticker trades places with an edge sticker
@@ -364,6 +422,9 @@ class ObjectiveTests(unittest.TestCase):
             s.run_search(s.SearchConfig(fitness="cubie", seed=1, generations=0), cube, log=lambda message: None)
         with self.assertRaises(s.InvalidInputError):
             s.run_search(s.SearchConfig(fitness="cubie-refined", seed=1, generations=0), cube,
+                         log=lambda message: None)
+        with self.assertRaises(s.InvalidInputError):
+            s.run_search(s.SearchConfig(fitness="corners-first", seed=1, generations=0), cube,
                          log=lambda message: None)
         result = s.run_search(s.SearchConfig(seed=1, generations=0), cube, log=lambda message: None)
         self.assertEqual(result.status, s.STATUS_BUDGET_EXHAUSTED)
