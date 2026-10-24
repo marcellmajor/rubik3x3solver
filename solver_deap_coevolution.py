@@ -35,8 +35,11 @@ The CLI also keeps a persistent library of up to 100 distinct move blocks
 (``--block-library PATH``, ``--no-block-library``); see
 persistent_move_block_library_specs.md.
 
+``--mitm`` adds an optional bounded meet-in-the-middle finisher that searches
+exactly from the best-ever candidate once few cubies are misplaced (off by default).
+
 Importing this module runs no search, prints nothing, creates no plots and
-touches no library file.
+touches no library or table cache file.
 """
 
 from __future__ import annotations
@@ -52,6 +55,7 @@ import signal
 import sys
 import tempfile
 import time
+from bisect import insort
 from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -85,6 +89,16 @@ DEFAULT_DIVERSITY_MIN_UNIQUE_RATIO = 0.10
 DEFAULT_DIVERSITY_MAX_DOMINANCE = 0.80
 DEFAULT_DIVERSITY_MIN_CUBIE_DISTANCE = 2.0
 DEFAULT_STAGNATION_GENERATIONS = 100
+
+# Optional bounded meet-in-the-middle finisher (--mitm). Initial engineering defaults,
+# not claims of optimal performance.
+MITM_MAX_DEPTH = 10
+DEFAULT_MITM_DEPTH = 10
+DEFAULT_MITM_TRIGGER_CUBIES = 4
+DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER = 6
+DEFAULT_MITM_INTERVAL = 50
+DEFAULT_MITM_ATTEMPT_SECONDS = 2.0
+DEFAULT_MITM_TOTAL_SECONDS = 30.0
 
 FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie", "edges",
                    "cubie-refined", "grouped-cubie", "corners-first")
@@ -1256,6 +1270,16 @@ class SearchConfig:
     diversity_max_dominance: float = DEFAULT_DIVERSITY_MAX_DOMINANCE
     diversity_min_cubie_distance: float = DEFAULT_DIVERSITY_MIN_CUBIE_DISTANCE
     stagnation_generations: int = DEFAULT_STAGNATION_GENERATIONS
+    # Optional bounded meet-in-the-middle finisher (off by default). ``mitm_cache`` is a
+    # directory for the reusable solved-side table, or None to keep it in memory only.
+    mitm: bool = False
+    mitm_depth: int = DEFAULT_MITM_DEPTH
+    mitm_trigger_cubies: int = DEFAULT_MITM_TRIGGER_CUBIES
+    mitm_corners_first_edge_trigger: int = DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER
+    mitm_interval: int = DEFAULT_MITM_INTERVAL
+    mitm_attempt_seconds: float = DEFAULT_MITM_ATTEMPT_SECONDS
+    mitm_total_seconds: float = DEFAULT_MITM_TOTAL_SECONDS
+    mitm_cache: Optional[str] = None
 
 
 def _require_int(name, value, minimum):
@@ -1297,6 +1321,22 @@ def validate_config(config):
         if (type(value) not in (int, float)) or not math.isfinite(value) or not 0 <= value <= upper:
             raise ConfigError(f"{name} must be a finite number in [0, {upper}], got {value!r}")
     _require_int("stagnation generations", config.stagnation_generations, 1)
+    if type(config.mitm) is not bool:
+        raise ConfigError("mitm must be True or False")
+    if type(config.mitm_depth) is not int or not 1 <= config.mitm_depth <= MITM_MAX_DEPTH:
+        raise ConfigError(f"mitm depth must be an integer from 1 to {MITM_MAX_DEPTH} (deeper searches are "
+                          f"not supported), got {config.mitm_depth!r}")
+    for name, value, upper in (("mitm trigger cubies", config.mitm_trigger_cubies, 20),
+                               ("mitm corners-first edge trigger", config.mitm_corners_first_edge_trigger, 12)):
+        if type(value) is not int or not 0 <= value <= upper:
+            raise ConfigError(f"{name} must be an integer from 0 to {upper}, got {value!r}")
+    _require_int("mitm interval", config.mitm_interval, 1)
+    for name, value in (("mitm attempt seconds", config.mitm_attempt_seconds),
+                        ("mitm total seconds", config.mitm_total_seconds)):
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ConfigError(f"{name} must be finite and strictly positive, got {value!r}")
+    if config.mitm_cache is not None and (not isinstance(config.mitm_cache, str) or not config.mitm_cache):
+        raise ConfigError("mitm cache must be a non-empty directory path or None")
     validate_operator_probabilities()
     return make_objective(config.fitness, config.manhattan_weight, config.misplaced_weight)
 
@@ -1324,6 +1364,7 @@ class RunResult:
     library_report: Optional[dict] = None
     diversity_records: list = field(default_factory=list)
     diversity_seconds: float = 0.0
+    finisher_report: Optional[dict] = None
 
 
 @dataclass
@@ -1637,8 +1678,13 @@ def _atomic_write(path, text):
     data = text.encode("utf-8")
     if len(data) > BLOCK_LIBRARY_MAX_BYTES:
         raise BlockLibraryError("the library would exceed 1 MiB", "unwritable")
+    _atomic_write_bytes(path, data, prefix=".move_blocks_")
+
+
+def _atomic_write_bytes(path, data, prefix):
+    """Temporary file beside ``path``, flushed and fsynced, then atomically replaced; directory synced."""
     directory = os.path.dirname(path)
-    descriptor, temporary = tempfile.mkstemp(prefix=".move_blocks_", suffix=".tmp", dir=directory)
+    descriptor, temporary = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
@@ -2006,6 +2052,353 @@ def diversity_report_lines(record, previous_flagged):
 
 
 # ---------------------------------------------------------------------------
+# Bounded meet-in-the-middle finisher (optional, --mitm)
+# ---------------------------------------------------------------------------
+
+MITM_CACHE_FORMAT = "rubik3x3solver-mitm-solved-side"
+MITM_CACHE_VERSION = 1
+# Exact number of positions at each half-turn distance from solved (OEIS A080601); a
+# breadth-first table must reproduce these counts exactly, which validates builds and loads.
+MITM_HALF_TURN_COUNTS = (1, 18, 243, 3240, 43239, 574908)
+MITM_CODE_BYTES = 18  # a 54-digit base-6 face-index code is below 2**140
+MITM_SOLVING_ALTERNATIVES = 8
+MITM_FALLBACK_ALTERNATIVES = 32
+MITM_OVER_CAPACITY_ALTERNATIVES = 8
+MITM_ATTEMPT_CACHE_LIMIT = 256
+_MITM_SOLVED = "".join(str(face) * 9 for face in range(6))
+_MITM_SOLVED_CODE = int(_MITM_SOLVED, 6)
+_HOME_CUBIE_POSES = dict(decode_cubie_poses(REFERENCE_SOLVED_KEY))
+_SOLVED_SIDE_TABLES = {}  # depth -> SolvedSideTable, reused by every attempt and run in this process
+
+
+class _FinisherTimeout(Exception):
+    """The finisher's own allowance ran out while the run's overall budget still has time."""
+
+
+def misplaced_cubies(key):
+    """``(corners, edges)`` whose position or orientation is wrong, relative to the face centres.
+
+    Counts pieces, not stickers. Raises ValueError for an inconsistent set of cubies.
+    """
+    corners = edges = 0
+    for cubie, pose in decode_cubie_poses(key):
+        if _HOME_CUBIE_POSES[cubie] != pose:
+            if len(cubie) == 3:
+                corners += 1
+            else:
+                edges += 1
+    return corners, edges
+
+
+def default_mitm_cache_dir():
+    """``$XDG_CACHE_HOME/rubik3x3solver``, else ``~/.cache/rubik3x3solver``."""
+    base = os.environ.get("XDG_CACHE_HOME")
+    if not base or not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "rubik3x3solver")
+
+
+def mitm_cache_file(directory, depth):
+    return os.path.join(directory, f"mitm_solved_side_v{MITM_CACHE_VERSION}_depth{depth}.bin")
+
+
+def _mitm_fingerprint(depth):
+    return _canonical_digest({"format": MITM_CACHE_FORMAT, "version": MITM_CACHE_VERSION,
+                              "move_convention": MOVE_CONVENTION_ID, "depth": depth, "solved": _MITM_SOLVED})
+
+
+def _mitm_decode(code):
+    digits = []
+    for _ in range(STICKER_COUNT):
+        code, digit = divmod(code, 6)
+        digits.append("012345"[digit])
+    return "".join(reversed(digits))
+
+
+class SolvedSideTable:
+    """Every state within ``depth`` half turns of solved, keyed by its exact base-6 face-index code.
+
+    States are face-index strings (colours replaced by the index of the matching centre), so a
+    recoloured cube matches the same table. Values pack ``distance * 19 + last move`` (0 for
+    solved); the path back to solved is rebuilt by undoing stored moves. The breadth-first build
+    uses the 18 real moves in fixed order, skips only same-face repeats (always safe), and can
+    resume after a stop: an incomplete table is never consulted.
+    """
+
+    def __init__(self, depth):
+        self.depth = depth
+        self.entries = {_MITM_SOLVED_CODE: 0}
+        self.complete = depth == 0
+        self.source = "built"
+        self._level = 0
+        self._frontier = [(_MITM_SOLVED, 0)]
+        self._next = []
+        self._position = 0
+
+    def extend(self, check=None):
+        """Continue building; ``check`` may raise between states and the progress is kept."""
+        entries = self.entries
+        while self._level < self.depth:
+            frontier, next_frontier = self._frontier, self._next
+            level = self._level + 1
+            while self._position < len(frontier):
+                if check is not None and self._position % 256 == 0:
+                    check()
+                state, last = frontier[self._position]
+                last_face = _ALLELE_FACE[last]
+                for allele in REAL_MOVES:
+                    if _ALLELE_FACE[allele] == last_face:
+                        continue
+                    child = "".join(_MOVE_TABLES[allele](state))
+                    code = int(child, 6)
+                    if code not in entries:
+                        entries[code] = level * 19 + allele
+                        next_frontier.append((child, allele))
+                self._position += 1
+            if len(next_frontier) != MITM_HALF_TURN_COUNTS[level]:
+                raise ConsistencyError(f"solved-side table has {len(next_frontier)} states at distance {level}, "
+                                       f"expected {MITM_HALF_TURN_COUNTS[level]}")
+            self._level, self._frontier, self._next, self._position = level, next_frontier, [], 0
+        self._frontier = []
+        self.complete = True
+        return True
+
+    def distance(self, code):
+        value = self.entries.get(code)
+        return None if value is None else value // 19
+
+    def path_to_solved(self, state):
+        """Moves taking the face-index ``state`` (which must be in the table) to solved."""
+        moves = []
+        value = self.entries[int(state, 6)]
+        while value:
+            undo = inverse_allele(value % 19)
+            moves.append(undo)
+            state = "".join(_MOVE_TABLES[undo](state))
+            value = self.entries[int(state, 6)]
+        return tuple(moves)
+
+
+def save_solved_side_table(table, directory):
+    """Write a complete table atomically: a JSON header line, then sorted 19-byte records."""
+    if not table.complete:
+        raise ConsistencyError("an incomplete solved-side table must not be cached")
+    body = b"".join(code.to_bytes(MITM_CODE_BYTES, "big") + bytes((value,))
+                    for code, value in sorted(table.entries.items()))
+    header = json.dumps({"format": MITM_CACHE_FORMAT, "version": MITM_CACHE_VERSION,
+                         "fingerprint": _mitm_fingerprint(table.depth), "depth": table.depth,
+                         "entries": len(table.entries), "body_sha256": hashlib.sha256(body).hexdigest()},
+                        sort_keys=True).encode("utf-8")
+    os.makedirs(directory, exist_ok=True)
+    _atomic_write_bytes(mitm_cache_file(directory, table.depth), header + b"\n" + body, prefix=".mitm_")
+
+
+def load_solved_side_table(directory, depth, check=None):
+    """The validated cached table, or None when absent. Raises ValueError for an invalid or stale file."""
+    expected = sum(MITM_HALF_TURN_COUNTS[:depth + 1])
+    record = MITM_CODE_BYTES + 1
+    limit = 4096 + expected * record
+    try:
+        with open(mitm_cache_file(directory, depth), "rb") as handle:
+            data = handle.read(limit + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"cannot read the cached table ({exc.strerror or exc})") from None
+    newline = data.find(b"\n")
+    if len(data) > limit or newline < 0:
+        raise ValueError("the cached table has the wrong size or no header")
+    try:
+        header = json.loads(data[:newline].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("the cached table header is not valid JSON") from None
+    wanted = {"format": MITM_CACHE_FORMAT, "version": MITM_CACHE_VERSION, "fingerprint": _mitm_fingerprint(depth),
+              "depth": depth, "entries": expected}
+    if not isinstance(header, dict) or any(header.get(name) != value for name, value in wanted.items()):
+        raise ValueError("the cached table is from another format version or move model")
+    body = data[newline + 1:]
+    if len(body) != expected * record or hashlib.sha256(body).hexdigest() != header.get("body_sha256"):
+        raise ValueError("the cached table is truncated or corrupt")
+    entries, counts = {}, [0] * (depth + 1)
+    for index in range(expected):
+        if check is not None and index % 8192 == 0:
+            check()
+        offset = index * record
+        code = int.from_bytes(body[offset:offset + MITM_CODE_BYTES], "big")
+        value = body[offset + MITM_CODE_BYTES]
+        distance, last = divmod(value, 19)
+        if distance > depth or (distance == 0) != (last == 0) or code in entries:
+            raise ValueError("the cached table contains an invalid record")
+        entries[code] = value
+        counts[distance] += 1
+    if tuple(counts) != MITM_HALF_TURN_COUNTS[:depth + 1] or entries.get(_MITM_SOLVED_CODE) != 0:
+        raise ValueError("the cached table does not hold the exact positions within its depth")
+    for index in range(0, expected, 997):  # spot-check parent links against the cube.py-derived moves
+        code = int.from_bytes(body[index * record:index * record + MITM_CODE_BYTES], "big")
+        distance, last = divmod(entries[code], 19)
+        if distance:
+            parent = "".join(_MOVE_TABLES[inverse_allele(last)](_mitm_decode(code)))
+            parent_value = entries.get(int(parent, 6))
+            if parent_value is None or parent_value // 19 != distance - 1:
+                raise ValueError("the cached table's move links do not match the move model")
+    table = SolvedSideTable(depth)
+    table.entries, table.complete, table.source, table._frontier = entries, True, "disk cache", []
+    return table
+
+
+def prepare_solved_side_table(depth, directory, check=None, report=None):
+    """Complete table from memory, the disk cache or a (resumable) build. ``check`` may raise to stop."""
+    table = _SOLVED_SIDE_TABLES.get(depth)
+    if table is not None and table.complete:
+        if table.source != "memory":
+            table.source = "memory"
+        return table
+    if table is None:
+        if directory is not None:
+            try:
+                loaded = load_solved_side_table(directory, depth, check)
+            except ValueError as exc:
+                loaded = None
+                if report is not None:
+                    report(f"Finisher cache: {exc} ({mitm_cache_file(directory, depth)}); rebuilding it")
+            if loaded is not None:
+                _SOLVED_SIDE_TABLES[depth] = loaded
+                return loaded
+        table = _SOLVED_SIDE_TABLES[depth] = SolvedSideTable(depth)
+    table.extend(check)
+    if directory is not None:
+        try:
+            save_solved_side_table(table, directory)
+        except OSError as exc:
+            if report is not None:
+                report(f"Finisher cache: cannot write {mitm_cache_file(directory, depth)} "
+                       f"({exc.strerror or exc}); the table stays in memory")
+    return table
+
+
+@dataclass
+class FinisherSearch:
+    termination: str      # "exhaustive", "solution found" or "timed out"
+    forward_target: int
+    forward_depth: int    # forward levels completely explored
+    states: int
+    solving: list         # complete solving suffixes, shortest first
+    alternatives: list    # strictly improving forward paths that fit after simplification, best first
+    over_capacity: list   # strictly improving forward paths that did not fit after simplification
+    seconds: float
+
+
+def mitm_search(start_key, table, depth, cost, prefix, capacity, *, check=None, deadline=None,
+                clock=time.monotonic):
+    """Bounded meet-in-the-middle search from the raw-colour state ``start_key``.
+
+    Forward states within ``depth - table.depth`` (= ceil(depth / 2)) half turns are matched
+    against the complete solved-side table (floor(depth / 2)), so a complete search finds a
+    solving path of at most ``depth`` moves whenever one exists, whatever the chromosome capacity.
+    Nothing is pruned for worse intermediate fitness. Every reached forward state is scored with
+    ``cost`` for the fallback; only those forward paths are fallback candidates, so this is not the
+    best improvement among all ``depth``-move sequences. ``check`` (overall budget) may raise;
+    reaching ``deadline`` ends the search with what it has.
+    """
+    if not table.complete:
+        raise ConsistencyError("the finisher must not search with an incomplete table")
+    started = clock()
+    centres = start_key[4] + start_key[13] + start_key[22] + start_key[31] + start_key[40] + start_key[49]
+    normalise = str.maketrans(centres, "012345")
+    entries = table.entries
+    forward_target = depth - table.depth
+    start_code = int(start_key.translate(normalise), 6)
+    parents = {start_code: 0}
+    start_order = (0 if start_code == _MITM_SOLVED_CODE else 1, cost(start_key))
+    prefix = tuple(prefix)
+    found, alternatives, over = [], [], []
+
+    def forward_path(raw):
+        moves = []
+        last = parents[int(raw.translate(normalise), 6)]
+        while last:
+            moves.append(last)
+            raw = "".join(_MOVE_TABLES[inverse_allele(last)](raw))
+            last = parents[int(raw.translate(normalise), 6)]
+        moves.reverse()
+        return tuple(moves)
+
+    def consider(raw, order):
+        if order >= start_order:
+            return
+        if len(alternatives) >= MITM_FALLBACK_ALTERNATIVES and order > alternatives[-1][0][:2]:
+            return
+        path = forward_path(raw)
+        combined = len(simplify(prefix + path))
+        keep, limit = (alternatives, MITM_FALLBACK_ALTERNATIVES) if combined <= capacity else (
+            over, MITM_OVER_CAPACITY_ALTERNATIVES)
+        insort(keep, ((order[0], order[1], combined, path), path))
+        del keep[limit:]
+
+    start_distance = entries.get(start_code)
+    if start_distance is not None:
+        found.append((start_distance // 19, 0, start_key))
+    frontier, level, completed, termination = [(start_key, 0)], 0, 0, "exhaustive"
+    try:
+        while level < forward_target:
+            if found and level + 1 >= min(found)[0]:
+                termination = "solution found"
+                break
+            level += 1
+            last_level = level == forward_target
+            next_frontier = []
+            for index, (raw, last) in enumerate(frontier):
+                if index % 64 == 0:
+                    if check is not None:
+                        check()
+                    if deadline is not None and clock() >= deadline:
+                        raise _FinisherTimeout()
+                last_face = _ALLELE_FACE[last]
+                for allele in REAL_MOVES:
+                    if _ALLELE_FACE[allele] == last_face:
+                        continue
+                    child = "".join(_MOVE_TABLES[allele](raw))
+                    code = int(child.translate(normalise), 6)
+                    if code in parents:
+                        continue
+                    parents[code] = allele
+                    if not last_level:
+                        next_frontier.append((child, allele))
+                    value = entries.get(code)
+                    if value is not None and level + value // 19 <= depth:
+                        found.append((level + value // 19, level, child))
+                    consider(child, (0 if value == 0 else 1, cost(child)))
+            frontier = next_frontier
+            completed = level
+    except _FinisherTimeout:
+        termination = "timed out"
+    found.sort(key=lambda item: item[:2])
+    solving = []
+    for _, _, raw in found[:MITM_SOLVING_ALTERNATIVES]:
+        solving.append(forward_path(raw) + table.path_to_solved(raw.translate(normalise)))
+    return FinisherSearch(termination, forward_target, completed, len(parents) - 1, solving,
+                          [path for _, path in alternatives], [path for _, path in over], clock() - started)
+
+
+def finisher_summary_line(summary):
+    """One line per attempt. A timed-out search never claims the cube is more than D moves away."""
+    source = summary["source"] if summary["uid"] is None else f"S#{summary['uid']}, {summary['source']}"
+    line = (f"[finisher gen {summary['generation']}] best-ever ({source}; {summary['active_length']} moves): "
+            f"{summary['corners']} corners + {summary['edges']} edges misplaced, H={summary['initial_cost']} | "
+            f"depth {summary['depth']} = table {summary['table_depth']} + forward "
+            f"{summary['forward_depth']}/{summary['forward_target']} ({summary['termination']}) | "
+            f"{summary['states']:,} states in {summary['search_seconds']:.2f}s | {summary['result']}")
+    if summary["suffix_length"] is not None:
+        line += (f" | suffix {summary['suffix_length']} moves, combined {summary['combined_before']} -> "
+                 f"{summary['combined_after']} moves, H={summary['result_cost']} "
+                 f"solved={'yes' if summary['result_solved'] else 'no'}")
+    line += f" | archive {'yes' if summary['archive'] else 'no'}, population {summary['population']}"
+    if summary["preparation_seconds"] >= 0.005:
+        line += f" | table {summary['table_source'] or 'not ready'} {summary['preparation_seconds']:.2f}s"
+    return line
+
+
+# ---------------------------------------------------------------------------
 # The cooperative search
 # ---------------------------------------------------------------------------
 
@@ -2051,6 +2444,14 @@ class CoevolutionRun:
         self.diversity_seconds = 0.0
         self._diversity_previous_flagged = False
         self._diversity_consecutive_flagged = 0
+        # Meet-in-the-middle finisher state (unused while config.mitm is False).
+        self._finisher_last_attempt = None
+        self._finisher_queue = []
+        self._finisher_cache = OrderedDict()
+        self.finisher_attempts = []
+        self.finisher_seconds = 0.0
+        self.finisher_preparation_seconds = 0.0
+        self.finisher_table_source = None
         self.last_block_summary = None
         self.history = tools.Logbook()
 
@@ -2749,9 +3150,14 @@ class CoevolutionRun:
             self.blocks = self.initial_block_population()
             self.partial_generation = None
             self.partial_phase = None
+            self.finisher_attempt(0)
             generations = self.config.generations
             for generation in range(1, generations + 1):
                 self.run_generation(generation, build_next_blocks=generation < generations)
+                # Results found right after setup join generation 1's offspring.
+                for record, replaced in self._insert_finisher_records():
+                    self.log(f"[finisher] S#{record.uid} replaced offspring S#{replaced.uid} "
+                             f"in generation {generation}'s population")
                 # Measured on the just-published population, before any library maintenance.
                 diversity = None
                 if self.config.diversity_checks and generation % DIVERSITY_CHECK_INTERVAL == 0:
@@ -2761,6 +3167,7 @@ class CoevolutionRun:
                     scheduled = generation == 1 or generation % BLOCK_LIBRARY_CHECKPOINT_INTERVAL == 0
                     if scheduled or self._library_flush_requested:
                         self._library_checkpoint(include_snapshot=scheduled)
+                self.finisher_attempt(generation)
                 if generation % self.config.log_every == 0:
                     self.report_progress()
             self._library_final_candidates()
@@ -2771,6 +3178,177 @@ class CoevolutionRun:
         except SearchStopped as stop:
             # No new reference evaluations after a time limit or SIGINT; completed ones are kept.
             return self._result(stop.status, str(stop) or stop.status)
+
+    # -- meet-in-the-middle finisher (optional, --mitm) ----------------------------------
+
+    def finisher_attempt(self, generation):
+        """Try to finish the best-ever candidate at a completed-generation boundary (0 = after setup).
+
+        Returns the attempt summary, or None when no attempt was due. A verified solve raises
+        SolutionFound through the normal archive path; the overall budget raises SearchStopped.
+        """
+        config = self.config
+        entry = self.archive
+        if not config.mitm or entry.solved:
+            return None
+        if self._finisher_last_attempt is not None and generation - self._finisher_last_attempt < config.mitm_interval:
+            return None
+        remaining = config.mitm_total_seconds - self.finisher_seconds
+        if remaining <= 0:
+            return None
+        try:
+            corners, edges = misplaced_cubies(entry.endpoint)
+        except ValueError:
+            return None
+        if not (corners + edges <= config.mitm_trigger_cubies or (
+                self.objective.state_function == "corners-first" and corners == 0
+                and edges <= config.mitm_corners_first_edge_trigger)):
+            return None
+        cache_key = (entry.endpoint, self.objective.identity, self.solution_capacity, config.mitm_depth)
+        previous = self._finisher_cache.get(cache_key)
+        if previous is not None and not previous["retryable"]:
+            return None  # the same search on the same endpoint was already completed or timed out
+        self.budget.check()  # never start finishing work after an overall stop
+        self._finisher_last_attempt = generation
+        summary = {"generation": generation, "source": entry.source, "uid": entry.uid,
+                   "active_length": len(entry.active), "corners": corners, "edges": edges,
+                   "initial_cost": entry.cost, "depth": config.mitm_depth, "table_depth": config.mitm_depth // 2,
+                   "forward_target": config.mitm_depth - config.mitm_depth // 2, "forward_depth": 0, "states": 0,
+                   "termination": None, "result": None, "suffix_length": None, "combined_before": None,
+                   "combined_after": None, "result_cost": None, "result_solved": False, "archive": False,
+                   "population": "-", "preparation_seconds": 0.0, "table_source": None, "search_seconds": 0.0,
+                   "seconds": 0.0}
+        started = time.monotonic()
+        allowance_end = started + remaining
+
+        def check_allowance():
+            self.budget.check()
+            if time.monotonic() >= allowance_end:
+                raise _FinisherTimeout()
+
+        solved_candidate = None
+        try:
+            try:
+                table = prepare_solved_side_table(config.mitm_depth // 2, config.mitm_cache, check_allowance,
+                                                  self.log)
+            except _FinisherTimeout:
+                summary.update(termination="preparation incomplete", result="no attempt (table not ready)")
+                return summary
+            finally:
+                prepared = time.monotonic() - started
+                summary["preparation_seconds"] = prepared
+                self.finisher_preparation_seconds += prepared
+            summary["table_source"] = self.finisher_table_source = table.source
+            deadline = min(time.monotonic() + config.mitm_attempt_seconds, allowance_end)
+            search = mitm_search(entry.endpoint, table, config.mitm_depth, self.objective.cost, entry.active,
+                                 self.solution_capacity, check=self.budget.check, deadline=deadline)
+            summary.update(termination=search.termination, forward_depth=search.forward_depth,
+                           states=search.states, search_seconds=search.seconds)
+            self.budget.check()  # verify a result only while the run still has time
+            solved_candidate = self._finisher_apply(entry, search, summary)
+            return summary
+        except SearchStopped:
+            summary.update(termination="stopped by the run's budget or SIGINT", result="abandoned")
+            raise
+        finally:
+            summary["seconds"] = time.monotonic() - started
+            self.finisher_seconds += summary["seconds"]
+            self._record_finisher_attempt(cache_key, summary)
+            if solved_candidate is not None:  # verified solve: the normal archive path ends the run
+                candidate, suffix = solved_candidate
+                self.offer_to_archive(candidate, uid=None, source=f"finisher depth {config.mitm_depth}",
+                                      block_payload=suffix)
+
+    def _finisher_reduce(self, entry, suffix):
+        """Join the candidate and suffix, then simplify across the join, cut state loops and shorten."""
+        proposal = tuple(entry.active) + tuple(suffix)
+        return proposal, shorten_sequence(self._remove_state_loops(simplify(proposal)))
+
+    def _finisher_apply(self, entry, search, summary):
+        """Verify the best usable result; returns a solved candidate for the caller to archive, else None."""
+        capacity = self.solution_capacity
+        solving_over_capacity = False
+        for suffix in search.solving:
+            proposal, reduced = self._finisher_reduce(entry, suffix)
+            if len(reduced) > capacity:
+                solving_over_capacity = True
+                continue
+            candidate = self.normalize_solution(reduced, check_budget=False)
+            if candidate.solved:
+                summary.update(result="solved", suffix_length=len(suffix), combined_before=len(proposal),
+                               combined_after=len(candidate.active), result_cost=candidate.cost, result_solved=True,
+                               archive=True, population="solve ends the run")
+                return candidate, suffix
+        for suffix in search.alternatives + search.over_capacity:
+            proposal, reduced = self._finisher_reduce(entry, suffix)
+            if len(reduced) > capacity:
+                continue
+            candidate = self.normalize_solution(reduced, check_budget=False)
+            if (0 if candidate.solved else 1, candidate.cost) >= (1, entry.cost):
+                continue  # only a strict improvement in the selected fitness is usable
+            if candidate.solved:
+                summary.update(result="solved", suffix_length=len(suffix), combined_before=len(proposal),
+                               combined_after=len(candidate.active), result_cost=candidate.cost,
+                               result_solved=True, archive=True, population="solve ends the run")
+                return candidate, suffix
+            record = self.make_solution(candidate, origin="finisher", operator=f"mitm-depth{self.config.mitm_depth}")
+            record.slot = "offspring"
+            archived = self.offer_to_archive(candidate, uid=record.uid, source=f"finisher depth {self.config.mitm_depth}",
+                                             block_payload=suffix)
+            self._finisher_queue.append(record)
+            inserted = self._insert_finisher_records()
+            summary.update(result="improved", suffix_length=len(suffix), combined_before=len(proposal),
+                           combined_after=len(candidate.active), result_cost=candidate.cost, archive=archived,
+                           population=(f"replaced offspring S#{inserted[0][1].uid}" if inserted
+                                       else "queued for generation 1's offspring"))
+            return None
+        if solving_over_capacity:
+            summary["result"] = "solving path exceeds the solution capacity after reductions"
+        elif search.solving:
+            summary["result"] = "solving path not verified"
+        else:
+            if search.termination == "exhaustive":
+                summary["termination"] = f"exhausted the depth-{self.config.mitm_depth} search without a solution"
+            summary["result"] = "no feasible improving fallback"
+        return None
+
+    def _insert_finisher_records(self):
+        """Put queued finisher candidates into the published population's offspring portion.
+
+        Each replaces the worst-ranked offspring (never an elite copy or a reset slot), so the
+        population size and 20/60/20 roles are unchanged and the next generation selects from it.
+        The all-NOOP initial population is never modified: results found right after setup wait
+        for generation 1.
+        """
+        if not self._finisher_queue or self.population is None or self.completed_generation < 1:
+            return []
+        population, inserted = self.population, []
+        while self._finisher_queue:
+            slots = [index for index, individual in enumerate(population)
+                     if individual.slot in ("offspring", "baseline-start") and individual.origin != "finisher"]
+            if not slots:
+                break
+            worst = max(slots, key=lambda index: (population[index].rank, population[index].uid))
+            record = self._finisher_queue.pop(0)
+            inserted.append((record, population[worst]))
+            population[worst] = record
+        return inserted
+
+    def _record_finisher_attempt(self, cache_key, summary):
+        self.finisher_attempts.append(summary)
+        retryable = summary["termination"] == "preparation incomplete"  # resumable table work
+        self._finisher_cache[cache_key] = {"retryable": retryable, "termination": summary["termination"],
+                                           "result": summary["result"], "states": summary["states"],
+                                           "coverage": (summary["forward_depth"], summary["table_depth"])}
+        self._finisher_cache.move_to_end(cache_key)
+        while len(self._finisher_cache) > MITM_ATTEMPT_CACHE_LIMIT:
+            self._finisher_cache.popitem(last=False)
+        self.log(finisher_summary_line(summary))
+
+    def finisher_report(self):
+        return {"enabled": self.config.mitm, "attempts": list(self.finisher_attempts),
+                "seconds": self.finisher_seconds, "preparation_seconds": self.finisher_preparation_seconds,
+                "table_source": self.finisher_table_source}
 
     # -- persistent block library (persistent_move_block_library_specs.md) ---------------
 
@@ -2898,6 +3476,7 @@ class CoevolutionRun:
             block_population_created=self.blocks is not None,
             diversity_records=list(self.diversity_records),
             diversity_seconds=self.diversity_seconds,
+            finisher_report=self.finisher_report(),
         )
 
     # -- reporting (section 11) ----------------------------------------------------------
@@ -3244,6 +3823,34 @@ def build_arg_parser():
                            help="warn after this many generations without better (unsolved, H) (default 100)")
     diversity.add_argument("--no-diversity-checks", action="store_true",
                            help="disable diversity measurements and warnings")
+    finisher = parser.add_argument_group(
+        "meet-in-the-middle finisher",
+        "Optional exact search from the best-ever candidate when few cubies are misplaced: a solved-side "
+        "table to floor(D/2) moves joined with a forward search to ceil(D/2) moves. Off by default.")
+    finisher.add_argument("--mitm", action=argparse.BooleanOptionalAction, default=False,
+                          help="enable the finisher (default: off)")
+    finisher.add_argument("--mitm-depth", type=int, default=DEFAULT_MITM_DEPTH,
+                          help=f"total search depth D, 1-{MITM_MAX_DEPTH} (default {DEFAULT_MITM_DEPTH})")
+    finisher.add_argument("--mitm-trigger-cubies", type=int, default=DEFAULT_MITM_TRIGGER_CUBIES,
+                          help="attempt when at most this many corners + edges are misplaced by position or "
+                               f"orientation (default {DEFAULT_MITM_TRIGGER_CUBIES})")
+    finisher.add_argument("--mitm-corners-first-edge-trigger", type=int,
+                          default=DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER,
+                          help="with --fitness corners-first, also attempt once all corners are home and at most "
+                               f"this many edges are misplaced (default {DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER})")
+    finisher.add_argument("--mitm-interval", type=int, default=DEFAULT_MITM_INTERVAL,
+                          help=f"minimum completed generations between attempts (default {DEFAULT_MITM_INTERVAL})")
+    finisher.add_argument("--mitm-attempt-seconds", type=float, default=DEFAULT_MITM_ATTEMPT_SECONDS,
+                          help=f"forward-search time per attempt (default {DEFAULT_MITM_ATTEMPT_SECONDS:g})")
+    finisher.add_argument("--mitm-total-seconds", type=float, default=DEFAULT_MITM_TOTAL_SECONDS,
+                          help="total finishing time per run, including table preparation "
+                               f"(default {DEFAULT_MITM_TOTAL_SECONDS:g})")
+    cache = finisher.add_mutually_exclusive_group()
+    cache.add_argument("--mitm-cache-dir", metavar="DIR", default=None,
+                       help="solved-side table cache directory (default: $XDG_CACHE_HOME/rubik3x3solver, "
+                            "else ~/.cache/rubik3x3solver)")
+    cache.add_argument("--no-mitm-cache", action="store_true",
+                       help="build the solved-side table in memory only; never read or write the disk cache")
     return parser
 
 
@@ -3269,7 +3876,24 @@ def config_from_args(args):
         diversity_max_dominance=args.diversity_max_dominance,
         diversity_min_cubie_distance=args.diversity_min_cubie_distance,
         stagnation_generations=args.stagnation_generations,
+        mitm=args.mitm,
+        mitm_depth=args.mitm_depth,
+        mitm_trigger_cubies=args.mitm_trigger_cubies,
+        mitm_corners_first_edge_trigger=args.mitm_corners_first_edge_trigger,
+        mitm_interval=args.mitm_interval,
+        mitm_attempt_seconds=args.mitm_attempt_seconds,
+        mitm_total_seconds=args.mitm_total_seconds,
+        mitm_cache=_resolve_mitm_cache(args),
     )
+
+
+def _resolve_mitm_cache(args):
+    """None keeps the solved-side table in memory only; else a cache directory."""
+    if args.no_mitm_cache:
+        return None
+    if args.mitm_cache_dir is not None:
+        return os.path.abspath(os.path.expanduser(args.mitm_cache_dir))
+    return default_mitm_cache_dir()
 
 
 def _resolve_block_library(args):
@@ -3322,6 +3946,17 @@ def _print_startup(config, objective, seed, seed_generated, input_cube):
               f"or >={config.stagnation_generations} generations without better cube quality")
     else:
         print("Diversity checks: disabled")
+    if config.mitm:
+        depth = config.mitm_depth
+        print(f"Finisher: meet-in-the-middle depth {depth} (table {depth // 2} + forward {depth - depth // 2}); "
+              f"attempt at <={config.mitm_trigger_cubies} misplaced cubies"
+              + (f" or corners home and <={config.mitm_corners_first_edge_trigger} edges"
+                 if objective.state_function == "corners-first" else "")
+              + f", every >={config.mitm_interval} generations; {config.mitm_attempt_seconds:g}s per attempt, "
+              f"{config.mitm_total_seconds:g}s total including table preparation; cache "
+              f"{config.mitm_cache or 'memory only'}")
+    else:
+        print("Finisher: disabled")
 
 
 def _print_final(result, final, finalization_seconds):
@@ -3349,6 +3984,12 @@ def _print_final(result, final, finalization_seconds):
         print(f"Diversity checks: {len(result.diversity_records)} (last at generation "
               f"{result.diversity_records[-1]['generation']}; {flagged} flagged); "
               f"diagnostic time {result.diversity_seconds:.3f}s")
+    report = result.finisher_report
+    if report and report["enabled"]:
+        attempts = report["attempts"]
+        print(f"Finisher: {len(attempts)} attempt(s), finishing time {report['seconds']:.2f}s "
+              f"(table preparation {report['preparation_seconds']:.2f}s, "
+              f"table {report['table_source'] or 'not prepared'})")
     if final.problems:
         for problem in final.problems:
             print(f"CONSISTENCY ERROR: {problem}")

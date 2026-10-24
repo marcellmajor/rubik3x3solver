@@ -18,6 +18,7 @@ solution.
 | [solver_deap.py](solver_deap.py) | DEAP genetic algorithm with elitism, algorithm-aware mutation, and a fitness plot. Current, most-tuned entry point. |
 | [solver_deap_coevolution.py](solver_deap_coevolution.py) | DEAP cooperative coevolution: solution candidates plus evolving move blocks, with a CLI. |
 | [test_solver_deap_coevolution.py](test_solver_deap_coevolution.py) | Deterministic `unittest` suite for the coevolution solver. |
+| [test_mitm_finisher.py](test_mitm_finisher.py) | Tests for the optional meet-in-the-middle finisher (`--mitm`). |
 | [benchmark_coevolution.py](benchmark_coevolution.py), [experiment_coevolution.txt](experiment_coevolution.txt) | Bounded comparison of the two DEAP solvers, and its recorded report. |
 | [pyproject.toml](pyproject.toml), [uv.lock](uv.lock) | Project metadata, dependencies, and the lockfile used by [uv](https://docs.astral.sh/uv/). |
 
@@ -274,6 +275,83 @@ reproducing the plain search exactly. Library callers opt in with
   if concurrent additions require fresh reference scoring, the save is deferred
   with a diagnostic and the current disk file is preserved.
 
+### Meet-in-the-middle finisher
+
+`--mitm` turns on an exact, bounded search that tries to finish the best-ever
+candidate once only a few cubies are wrong. It is off by default, and with it
+off nothing about the search changes.
+
+- **Search:** a table of every state within `floor(D/2)` moves of solved is
+  joined with a breadth-first search to `ceil(D/2)` moves forward from the
+  candidate's endpoint, so a finished search finds the shortest solving suffix
+  of at most `D` moves (`--mitm-depth`, 1–10, default 10). States are compared
+  by exact identity after recolouring to the face centres. The only pruning is
+  skipping a second turn of the same face, which is always safe. Worse
+  intermediate fitness is never pruned, and the GA's random numbers are never
+  used, so attempts are deterministic.
+- **Triggers:** an attempt starts when at most `--mitm-trigger-cubies` (4)
+  corners plus edges are wrong in position or orientation. With
+  `--fitness corners-first` it also starts once every corner is home and at
+  most `--mitm-corners-first-edge-trigger` (6) edges are wrong. The finisher
+  checks once after setup and then after completed generations, at most once per
+  `--mitm-interval` (50) generations. It only works from the best-ever
+  candidate and skips solved endpoints.
+- **Joining:** the suffix is appended to the candidate's moves. The joined
+  sequence is simplified across the join, state loops are removed, it is
+  shortened, normalised and replayed through `cube.py` before use. Capacity
+  is checked after these reductions, so a raw join longer than
+  `--solution-capacity` can still fit. A solving path that stays too long is
+  reported as such.
+- **Fallback:** when no solution is found, the finisher keeps up to 32
+  forward paths that strictly improve the selected fitness and uses the best one
+  that fits. These are only the forward half (at most `ceil(D/2)` moves). This is
+  not the best improvement among all `D`-move sequences.
+- **Results:** a solve ends the run through the normal verified-solve path. An
+  improvement becomes the best-ever entry and replaces the worst-ranked
+  offspring of the just-published population. Elite copies, resets and the
+  population size stay the same. Results found right after setup wait for
+  generation 1, so the all-NOOP initial population is never changed. The
+  suffix is offered to the block library like any other improving block.
+- **Time:** each attempt's forward search gets `--mitm-attempt-seconds` (2).
+  All attempts together, including table preparation, get
+  `--mitm-total-seconds` (30). Finishing time also counts toward
+  `--time-limit` and stops on Ctrl+C. An attempt that runs out of time is
+  reported as "timed out", never as "more than `D` moves away". The finisher
+  never repeats an attempt on the same endpoint, except one whose table
+  preparation was cut short.
+- **Table cache:** the depth-5 table (621,649 states, about 12 MB on disk and
+  about 200 MB in memory) takes about 1.5 s to build and 0.3 s to load. It is
+  built only when the first attempt needs it and kept in memory for later
+  attempts. It is cached at
+  `$XDG_CACHE_HOME/rubik3x3solver/mitm_solved_side_v1_depth5.bin` (else
+  `~/.cache/...`); `--mitm-cache-dir DIR` moves it and `--no-mitm-cache` keeps
+  it in memory only. The file carries a format version and a fingerprint of
+  the move model. It is checked against the exact number of states at each
+  distance, written atomically, and rebuilt when stale or corrupt. A stopped
+  build resumes at the next attempt.
+- **Output:** each attempt prints one `[finisher gen N]` line with the counts
+  of wrong cubies, the table and forward depth reached, how the search ended,
+  states and time, the result and where it went. Table preparation time is
+  shown separately. The final report gives the number of attempts and the
+  total finishing and preparation time.
+
+Under CPython a full depth-10 forward search visits 621,648 states and takes
+about 2.4 s with `manhattan`, slightly more than the 2 s default. Raise
+`--mitm-attempt-seconds` to let it finish.
+
+Measured with 200 solutions, 100 blocks, solution capacity 32, block capacity
+16 and 16 contexts, `manhattan`, CPython, 60 s per run, seeds 42–44:
+- **8-move scramble:** solved in 3 of 3 runs with the finisher (in 2.7–6.5 s,
+  11 moves) and in 0 of 3 without it.
+- **Default cube** (4 edges wrong, more than 10 moves away): solved in 1 of 3
+  runs with the finisher and 0 of 3 without it.
+- **10- and 12-move scrambles:** the finisher never started, because the
+  search never got down to 4 wrong cubies, and the results were identical.
+
+Cold and warm caches made the same attempts at the same generations. They
+differed only in preparation time: 1.4–1.5 s to build the table, 0.3 s to load
+it.
+
 ## Benchmark ([benchmark_coevolution.py](benchmark_coevolution.py))
 
 Runs both DEAP solvers on the active checkpoint from `solver_deap.py` for
@@ -308,9 +386,11 @@ uv run python solver_deap_coevolution.py --fitness cubie-refined --seed 42
 uv run python solver_deap_coevolution.py --fitness grouped-cubie --seed 42
 uv run python solver_deap_coevolution.py --seed 42 --block-library my_blocks.json
 uv run python solver_deap_coevolution.py --seed 42 --no-block-library
+uv run python solver_deap_coevolution.py --seed 42 --mitm   # with the meet-in-the-middle finisher
 uv run python -m unittest test_solver_deap_coevolution -v
 uv run python -m unittest test_block_library -v
 uv run python -m unittest test_population_diversity -v
+uv run python -m unittest test_mitm_finisher -v
 uv run python benchmark_coevolution.py   # ~15 minutes
 ```
 

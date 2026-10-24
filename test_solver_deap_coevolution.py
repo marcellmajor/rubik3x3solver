@@ -54,6 +54,11 @@ def scrambled(moves):
     return s.cube_from_key(key_after(SOLVED_KEY, moves))
 
 
+def scrambled_default_cube():
+    """A fully scrambled input, so CLI tests do not depend on the module's default cube."""
+    return s.Cube("WYRYGRGRY", ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"], "WGWRBBGWR")
+
+
 def make_run(input_cube=None, *, seed=1, budget=None, **overrides):
     config = s.SearchConfig(seed=seed, log_every=10 ** 6, **overrides)
     objective = s.validate_config(config)
@@ -515,7 +520,7 @@ class PopulationPolicyTests(unittest.TestCase):
 
     def test_twenty_sixty_twenty_replacement_with_160_improved(self):
         run = make_run(scrambled("R1 U2 C3 D1 B2 L3 R2 C1 U3 B1 D2 L1 R3 C2 U1 B3 D3 L2 R1 C3"),
-                       solution_population=200, seed=12)
+                       solution_population=200, block_population=100, contexts=8, seed=12)
         rng = random.Random(8)
         improved, seen = [], set()
         while len(improved) < 160:
@@ -1028,6 +1033,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIs(run.find_block(top[0].uid), top[0])
         self.assertIsNone(run.find_block(10 ** 9))
 
+    @mock.patch.object(s, "default_input_cube", scrambled_default_cube)
     def test_cli_prints_each_new_best_state_and_top_blocks(self):
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):

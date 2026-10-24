@@ -106,6 +106,11 @@ def scrambled(moves):
     return s.replay(s.cube_from_key(SOLVED), s.parse_moves(moves))
 
 
+def scrambled_default_cube():
+    """A fully scrambled input, so CLI tests do not depend on the module's default cube."""
+    return s.Cube("WYRYGRGRY", ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"], "WGWRBBGWR")
+
+
 def small_config(path, **overrides):
     values = dict(seed=3, generations=3, solution_population=20, block_population=20, contexts=6,
                   solution_capacity=16, block_capacity=8, min_block_gain=1.0, log_every=10, block_library=path)
@@ -349,6 +354,7 @@ class DisabledTests(LibraryTestCase):
         run = make_run(config, cube)
         self.assertEqual(search_digest(run, run.run()), PRE_FEATURE_DIGESTS["manhattan"])
 
+    @mock.patch.object(s, "default_input_cube", scrambled_default_cube)
     def test_cli_flags(self):
         args = ["--seed", "7", "--generations", "2", "--solution-population", "20", "--block-population", "20",
                 "--contexts", "6", "--solution-capacity", "16", "--block-capacity", "8"]
