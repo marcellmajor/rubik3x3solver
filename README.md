@@ -20,6 +20,7 @@ solution.
 | [test_solver_deap_coevolution.py](test_solver_deap_coevolution.py) | Deterministic `unittest` suite for the coevolution solver. |
 | [test_mitm_finisher.py](test_mitm_finisher.py) | Tests for the meet-in-the-middle finisher (`--mitm`, on by default). |
 | [test_adaptive_recovery.py](test_adaptive_recovery.py) | Tests for the optional adaptive population recovery (`--adaptive-recovery`). |
+| [test_manual_mitm.py](test_manual_mitm.py) | Tests for the manual finisher trigger (pressing M during a run). |
 | [benchmark_coevolution.py](benchmark_coevolution.py), [experiment_coevolution.txt](experiment_coevolution.txt) | Bounded comparison of the two DEAP solvers, and its recorded report. |
 | [pyproject.toml](pyproject.toml), [uv.lock](uv.lock) | Project metadata, dependencies, and the lockfile used by [uv](https://docs.astral.sh/uv/). |
 
@@ -341,8 +342,10 @@ reproducing the plain search exactly. Library callers opt in with
 ### Meet-in-the-middle finisher
 
 The CLI runs an exact, bounded search that tries to finish the best-ever
-candidate once only a few cubies are wrong. It is on by default; `--no-mitm`
-turns it off, and with it off nothing about the search changes. Library
+candidate once only a few cubies are wrong. Automatic attempts are on by
+default; `--no-mitm` turns them off, and with them off nothing about the
+search changes. Pressing M still requests a single attempt (see **Manual
+trigger** below). Library
 callers opt in with `SearchConfig(mitm=True)`; it is off by default there.
 The first attempt in a run builds or loads the solved-side table (see
 **Table cache** below).
@@ -407,11 +410,40 @@ The first attempt in a run builds or loads the solved-side table (see
   the move model. It is checked against the exact number of states at each
   distance, written atomically, and rebuilt when stale or corrupt. A stopped
   build resumes at the next attempt.
-- **Output:** each attempt prints one `[finisher gen N]` line with the counts
-  of wrong cubies, the table and forward depth reached, how the search ended,
-  states and time, the result and where it went. Table preparation time is
-  shown separately. The final report gives the number of attempts and the
-  total finishing and preparation time.
+- **Manual trigger:** in an interactive terminal, pressing `M` or `m` (no
+  Enter) requests one attempt on the current best-ever candidate. It prints
+  "Manual MITM requested; will run at the next safe generation boundary."
+  and runs when the current generation finishes, so it may wait a while with
+  large populations.
+  - The attempt uses the best-ever candidate and the active fitness at that
+    boundary, not at the moment of the key press.
+  - It skips the automatic trigger, interval and same-endpoint rules, and
+    runs even with `--no-mitm`, without turning automatic attempts on.
+  - It keeps `--mitm-depth`, `--mitm-attempt-seconds`, the shared
+    `--mitm-total-seconds`, `--time-limit`, Ctrl+C and the usual result
+    handling. A solve ends the run after verification, a strict improvement
+    joins the population as above, and otherwise nothing changes.
+  - At most one attempt runs per boundary, and a manual request goes before
+    an automatic one. Repeated presses while one is queued or running are
+    ignored. A request that cannot run is dropped with its reason in the log.
+  - Only the key reader touches the terminal: it reads keys in a background
+    thread and only queues requests. On macOS and Linux it switches the
+    terminal to single-key input with echo off, keeps Ctrl+C working, and
+    restores the terminal on every exit. On Windows it uses `msvcrt`
+    (untested).
+  - With redirected or piped input it never reads stdin, and the startup line
+    says the shortcut is unavailable.
+- **Output:** each attempt prints one `[finisher gen N]` line marked
+  `automatic attempt` or `manual attempt`.
+  - The line gives the counts of wrong cubies, the table and forward depth
+    reached, how the search ended, states and time, and the result and where
+    it went.
+  - It ends with the outcome (solved, improved, no usable improvement or
+    stopped) and the attempt time. Table preparation time is shown
+    separately.
+  - A manual attempt also prints when it starts or why it was skipped.
+  - The final report gives the number of attempts (how many were manual) and
+    the total finishing and preparation time.
 
 A complete depth-10 forward search visits 621,648 states. Under CPython it
 takes about 2.9 s with `manhattan`, 3.1 s with `cubie` and 5.1–5.4 s with
@@ -576,13 +608,14 @@ uv run python solver_deap_coevolution.py --fitness cubie-refined --seed 42
 uv run python solver_deap_coevolution.py --fitness grouped-cubie --seed 42
 uv run python solver_deap_coevolution.py --seed 42 --block-library my_blocks.json
 uv run python solver_deap_coevolution.py --seed 42 --no-block-library
-uv run python solver_deap_coevolution.py --seed 42 --no-mitm   # without the meet-in-the-middle finisher
+uv run python solver_deap_coevolution.py --seed 42 --no-mitm   # no automatic finisher attempts; M still requests one
 uv run python solver_deap_coevolution.py --seed 42 --adaptive-recovery
 uv run python -m unittest test_solver_deap_coevolution -v
 uv run python -m unittest test_block_library -v
 uv run python -m unittest test_population_diversity -v
 uv run python -m unittest test_mitm_finisher -v
 uv run python -m unittest test_adaptive_recovery -v
+uv run python -m unittest test_manual_mitm -v
 uv run python benchmark_coevolution.py   # ~15 minutes
 ```
 

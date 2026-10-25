@@ -45,6 +45,8 @@ persistent_move_block_library_specs.md.
 
 The CLI also runs a bounded meet-in-the-middle finisher that searches exactly from
 the best-ever candidate once few cubies are misplaced (on by default; ``--no-mitm``).
+In an interactive terminal, pressing M requests one such attempt at the next
+generation boundary, even with ``--no-mitm``.
 ``--adaptive-recovery`` adds an optional intervention for persistent stagnation with low
 solution-population diversity, decided at the diversity checks (off by default).
 
@@ -64,6 +66,7 @@ import random
 import signal
 import sys
 import tempfile
+import threading
 import time
 from bisect import insort
 from collections import Counter, OrderedDict, defaultdict, deque
@@ -2557,7 +2560,8 @@ def mitm_search(start_key, table, depth, cost, prefix, capacity, *, check=None, 
 def finisher_summary_line(summary):
     """One line per attempt. A timed-out search never claims the cube is more than D moves away."""
     source = summary["source"] if summary["uid"] is None else f"S#{summary['uid']}, {summary['source']}"
-    line = (f"[finisher gen {summary['generation']}] best-ever ({source}; {summary['active_length']} moves): "
+    line = (f"[finisher gen {summary['generation']}] {summary.get('trigger', 'automatic')} attempt, "
+            f"best-ever ({source}; {summary['active_length']} moves): "
             f"{summary['corners']} corners + {summary['edges']} edges misplaced, H={summary['initial_cost']} | "
             f"depth {summary['depth']} = table {summary['table_depth']} + forward "
             f"{summary['forward_depth']}/{summary['forward_target']} ({summary['termination']}) | "
@@ -2571,6 +2575,8 @@ def finisher_summary_line(summary):
     line += f" | archive {'yes' if summary['archive'] else 'no'}, population {summary['population']}"
     if summary["preparation_seconds"] >= 0.005:
         line += f" | table {summary['table_source'] or 'not ready'} {summary['preparation_seconds']:.2f}s"
+    if summary.get("outcome"):
+        line += f" | outcome: {summary['outcome']} after {summary['seconds']:.2f}s"
     return line
 
 
@@ -2582,8 +2588,13 @@ def finisher_summary_line(summary):
 class CoevolutionRun:
     """One reproducible run: owns its RNG, counters, archive and both populations."""
 
-    def __init__(self, config, input_key, objective, seed, *, budget=None, log=None, on_improvement=None):
+    def __init__(self, config, input_key, objective, seed, *, budget=None, log=None, on_improvement=None,
+                 manual_requests=None):
         self.config = config
+        # Manual finisher requests (pressing M in the CLI): only take()/finish() are used, at
+        # generation boundaries; None means no manual control.
+        self.manual_requests = manual_requests
+        self.manual_finisher_events = []
         # Grouped-alternating runs swap between two concrete phase objectives;
         # self.objective always holds the currently active one.
         self._alternating = objective.state_function == "grouped-alternating"
@@ -3466,7 +3477,7 @@ class CoevolutionRun:
             self.blocks = self.initial_block_population()
             self.partial_generation = None
             self.partial_phase = None
-            self.finisher_attempt(0)
+            self.finisher_boundary(0)
             generations = self.config.generations
             for generation in range(1, generations + 1):
                 self.run_generation(generation, build_next_blocks=generation < generations)
@@ -3484,7 +3495,7 @@ class CoevolutionRun:
                     scheduled = generation == 1 or generation % BLOCK_LIBRARY_CHECKPOINT_INTERVAL == 0
                     if scheduled or self._library_flush_requested:
                         self._library_checkpoint(include_snapshot=scheduled)
-                finisher_summary = self.finisher_attempt(generation)
+                finisher_summary = self.finisher_boundary(generation)
                 if diversity is not None and self.config.adaptive_recovery:
                     self.recovery_checkpoint(generation, diversity, finisher_summary)
                 if generation % self.config.log_every == 0:
@@ -3558,12 +3569,13 @@ class CoevolutionRun:
             return
         if generation >= config.generations:
             return  # no generation left to build with recovery
-        if not config.mitm:
+        if finisher_summary is not None:
+            manual = " (manual)" if finisher_summary.get("trigger") == "manual" else ""
+            finisher = f"attempted{manual}: {finisher_summary['result']}"
+        elif not config.mitm:
             finisher = "finisher disabled"
-        elif finisher_summary is None:
-            finisher = f"not attempted ({self.finisher_skip_reason})"
         else:
-            finisher = f"attempted: {finisher_summary['result']}"
+            finisher = f"not attempted ({self.finisher_skip_reason})"
         if finisher_summary is not None and finisher_summary["result"] == "improved":
             # A verified quality improvement is already in the population; recovery waits.
             self.recovery_postponements += 1
@@ -3887,17 +3899,74 @@ class CoevolutionRun:
         self.finisher_skip_reason = skip
         if skip is not None:
             return None
-        remaining = config.mitm_total_seconds - self.finisher_seconds
         self.budget.check()  # never start finishing work after an overall stop
         self._finisher_last_attempt = generation
-        summary = {"generation": generation, "source": entry.source, "uid": entry.uid,
+        return self._finisher_run(generation, entry, cache_key, corners, edges, "automatic")
+
+    def finisher_boundary(self, generation):
+        """At most one finisher attempt per boundary: a pending manual request first, else automatic."""
+        requests = self.manual_requests
+        if requests is not None and requests.take():
+            try:
+                return self.manual_finisher_attempt(generation)
+            finally:
+                requests.finish()
+        return self.finisher_attempt(generation)
+
+    def manual_finisher_attempt(self, generation):
+        """One requested attempt (pressing M) on the best-ever candidate at this boundary.
+
+        Bypasses the automatic trigger, interval and same-endpoint suppression, and runs even
+        when automatic attempts are off (--no-mitm). Keeps the run's budget and interruption,
+        the configured depth, the per-attempt time, the shared cumulative finishing time and
+        the usual result handling. It never changes when automatic attempts happen.
+        """
+        config = self.config
+        entry = self.archive
+        try:
+            self.budget.check()  # a request never runs after the run has stopped
+        except SearchStopped:
+            self._manual_finisher_event(generation, "not run", "the solver stopped first")
+            raise
+        skip = None
+        if entry.solved:
+            skip = "the best-ever candidate is already solved"
+        elif config.mitm_total_seconds - self.finisher_seconds <= 0:
+            skip = (f"the cumulative finishing time ({config.mitm_total_seconds:g}s, --mitm-total-seconds) "
+                    "is spent")
+        if skip is not None:
+            self.finisher_skip_reason = f"manual request skipped: {skip}"
+            self._manual_finisher_event(generation, "skipped", skip)
+            self.log(f"[finisher gen {generation}] manual MITM skipped: {skip}")
+            return None
+        try:
+            corners, edges = misplaced_cubies(entry.endpoint)
+        except ValueError:
+            corners = edges = None
+        cache_key = (entry.endpoint, self.objective.identity, self.solution_capacity, config.mitm_depth)
+        self._manual_finisher_event(generation, "started", None)
+        self.log(f"[finisher gen {generation}] manual MITM started on the best-ever candidate: "
+                 f"H={entry.cost}, {len(entry.active)} moves")
+        return self._finisher_run(generation, entry, cache_key, corners, edges, "manual")
+
+    def _manual_finisher_event(self, generation, status, reason):
+        self.manual_finisher_events.append({"generation": generation, "status": status, "reason": reason})
+
+    def _finisher_run(self, generation, entry, cache_key, corners, edges, trigger):
+        """One bounded attempt from ``entry`` (frozen with the current objective for its duration)."""
+        config = self.config
+        if self.manual_requests is not None:
+            self.manual_requests.begin()  # presses during any attempt are ignored, not queued
+        remaining = config.mitm_total_seconds - self.finisher_seconds
+        summary = {"generation": generation, "trigger": trigger, "source": entry.source, "uid": entry.uid,
                    "active_length": len(entry.active), "corners": corners, "edges": edges,
                    "initial_cost": entry.cost, "depth": config.mitm_depth, "table_depth": config.mitm_depth // 2,
                    "forward_target": config.mitm_depth - config.mitm_depth // 2, "forward_depth": 0, "states": 0,
                    "termination": None, "result": None, "suffix_length": None, "combined_before": None,
                    "combined_after": None, "result_cost": None, "result_solved": False, "archive": False,
                    "population": "-", "preparation_seconds": 0.0, "table_source": None, "search_seconds": 0.0,
-                   "candidates": 0, "candidates_checked": 0, "processing": None, "seconds": 0.0}
+                   "candidates": 0, "candidates_checked": 0, "processing": None, "outcome": None,
+                   "seconds": 0.0}
         started = time.monotonic()
         allowance_end = started + remaining
 
@@ -3941,6 +4010,10 @@ class CoevolutionRun:
         finally:
             summary["seconds"] = time.monotonic() - started
             self.finisher_seconds += summary["seconds"]
+            summary["outcome"] = {"solved": "solved", "improved": "improved",
+                                  "abandoned": "stopped"}.get(summary["result"], "no usable improvement")
+            if self.manual_requests is not None:
+                self.manual_requests.finish()
             self._record_finisher_attempt(cache_key, summary)
             if solved_candidate is not None:  # verified solve: the normal archive path ends the run
                 candidate, suffix = solved_candidate
@@ -4052,6 +4125,8 @@ class CoevolutionRun:
 
     def finisher_report(self):
         return {"enabled": self.config.mitm, "attempts": list(self.finisher_attempts),
+                "manual_attempts": sum(1 for attempt in self.finisher_attempts if attempt["trigger"] == "manual"),
+                "manual_events": list(self.manual_finisher_events),
                 "seconds": self.finisher_seconds, "preparation_seconds": self.finisher_preparation_seconds,
                 "table_source": self.finisher_table_source}
 
@@ -4563,10 +4638,13 @@ def build_arg_parser():
     finisher = parser.add_argument_group(
         "meet-in-the-middle finisher",
         "Exact search from the best-ever candidate when few cubies are misplaced: a solved-side "
-        "table to floor(D/2) moves joined with a forward search to ceil(D/2) moves. On by default; "
-        "--no-mitm turns it off.")
+        "table to floor(D/2) moves joined with a forward search to ceil(D/2) moves. Automatic "
+        "attempts are on by default; --no-mitm turns them off. In an interactive terminal, pressing M "
+        "(no Enter) requests one bounded attempt on the current best candidate at the next generation "
+        "boundary, even with --no-mitm; it uses the same depth and time limits.")
     finisher.add_argument("--mitm", action=argparse.BooleanOptionalAction, default=True,
-                          help="run the finisher (default: on; --no-mitm turns it off)")
+                          help="run automatic finisher attempts (default: on; --no-mitm turns them off; "
+                               "pressing M still requests one)")
     finisher.add_argument("--mitm-depth", type=int, default=DEFAULT_MITM_DEPTH,
                           help=f"total search depth D, 1-{MITM_MAX_DEPTH} (default {DEFAULT_MITM_DEPTH})")
     finisher.add_argument("--mitm-trigger-cubies", type=int, default=DEFAULT_MITM_TRIGGER_CUBIES,
@@ -4698,7 +4776,7 @@ def _print_startup(config, objective, seed, seed_generated, input_cube):
               f"{config.mitm_total_seconds:g}s total including table preparation; cache "
               f"{config.mitm_cache or 'memory only'} (--no-mitm turns it off)")
     else:
-        print("Finisher: disabled (--no-mitm)")
+        print("Finisher: automatic attempts disabled (--no-mitm)")
     if config.adaptive_recovery:
         print(f"Adaptive recovery: after {config.recovery_consecutive_checks} consecutive health checks with "
               f"NO_QUALITY_PROGRESS plus a diversity warning, rebuild the next generation's offspring; cooldown "
@@ -4735,11 +4813,14 @@ def _print_final(result, final, finalization_seconds):
               f"{result.diversity_records[-1]['generation']}; {flagged} flagged); "
               f"diagnostic time {result.diversity_seconds:.3f}s")
     report = result.finisher_report
-    if report and report["enabled"]:
+    if report and (report["enabled"] or report["attempts"] or report["manual_events"]):
         attempts = report["attempts"]
-        print(f"Finisher: {len(attempts)} attempt(s), finishing time {report['seconds']:.2f}s "
-              f"(table preparation {report['preparation_seconds']:.2f}s, "
+        print(f"Finisher: {len(attempts)} attempt(s) ({report['manual_attempts']} manual), finishing time "
+              f"{report['seconds']:.2f}s (table preparation {report['preparation_seconds']:.2f}s, "
               f"table {report['table_source'] or 'not prepared'})")
+        unrun = [event for event in report["manual_events"] if event["status"] != "started"]
+        for event in unrun:
+            print(f"    manual request at generation {event['generation']} {event['status']}: {event['reason']}")
     if result.objective_switches:
         switches = "; ".join(f"gen {switch['generation']}: {switch['from']} -> {switch['to']} "
                              f"({switch['reason']})" for switch in result.objective_switches)
@@ -4823,6 +4904,174 @@ def _print_improvement(run, entry):
     sys.stdout.flush()
 
 
+MANUAL_MITM_KEYS = "Mm"
+MANUAL_MITM_ACK = "Manual MITM requested; will run at the next safe generation boundary."
+KEYBOARD_POLL_SECONDS = 0.25  # the reader blocks this long per wait; it never busy-waits
+
+
+class ManualMitmRequests:
+    """Thread-safe single slot for manual finisher requests (pressing M).
+
+    The keyboard thread only calls ``request``; the solver calls ``take`` at a generation
+    boundary, ``begin`` when any attempt (automatic or manual) starts, and ``finish`` after it.
+    Requests coalesce while one is pending and are ignored while an attempt runs, so key
+    repeat can never build a backlog.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = False
+        self._active = False
+        self._queued = threading.Event()
+
+    def request(self):
+        """Queue one request; False when coalesced into a pending or running one."""
+        with self._lock:
+            if self._pending or self._active:
+                return False
+            self._pending = True
+            self._queued.set()
+            return True
+
+    def take(self):
+        """Claim the pending request for an attempt that starts now."""
+        with self._lock:
+            if not self._pending:
+                return False
+            self._pending, self._active = False, True
+            self._queued.clear()
+            return True
+
+    def begin(self):
+        """An attempt is running: key presses are ignored until ``finish``."""
+        with self._lock:
+            self._active = True
+
+    def finish(self):
+        with self._lock:
+            self._active = False
+
+    @property
+    def pending(self):
+        with self._lock:
+            return self._pending
+
+    def wait_for_request(self, timeout):
+        return self._queued.wait(timeout)
+
+
+class KeyboardControl:
+    """Single-key reader for the CLI: M or m (no Enter) queues one manual finisher request.
+
+    Runs in a daemon thread and only ever calls ``requests.request()``; it never touches the
+    solver. It works only when stdin is an interactive terminal and never reads redirected
+    or piped input. On macOS/Linux the terminal is put in cbreak mode (no line buffering, no
+    echo, but Ctrl+C still raises SIGINT) and restored on exit; Windows uses msvcrt.
+    """
+
+    def __init__(self, requests, *, stdin=None, out=None, poll_seconds=KEYBOARD_POLL_SECONDS):
+        self.requests = requests
+        self.stdin = sys.stdin if stdin is None else stdin
+        self.out = out if out is not None else (lambda message: print(message, flush=True))
+        self.poll_seconds = poll_seconds
+        self.available, self.reason = self._check()
+        self._stop = threading.Event()
+        self._thread = None
+        self._fd = None
+        self._saved_mode = None
+
+    def _check(self):
+        try:
+            interactive = bool(self.stdin.isatty())
+        except (AttributeError, ValueError, OSError):
+            interactive = False
+        if not interactive:
+            return False, "stdin is not an interactive terminal"
+        if sys.platform == "win32":
+            try:
+                import msvcrt  # noqa: F401
+            except ImportError:
+                return False, "msvcrt is unavailable"
+            return True, None
+        try:
+            import termios  # noqa: F401
+            import tty  # noqa: F401
+        except ImportError:
+            return False, "termios is unavailable"
+        return True, None
+
+    def status_line(self):
+        if self.available:
+            return ("Keyboard control: press M to request a bounded MITM attempt on the current best candidate "
+                    "(it runs once the current generation finishes)")
+        return f"Keyboard control: unavailable ({self.reason}); the M shortcut is off, solving continues normally"
+
+    def handle_key(self, key):
+        """Queue a request for M or m; any other key is ignored."""
+        if key in MANUAL_MITM_KEYS and self.requests.request():
+            self.out(MANUAL_MITM_ACK)
+
+    def __enter__(self):
+        if not self.available:
+            return self
+        if sys.platform == "win32":
+            target = self._read_windows
+        else:
+            import termios
+            try:
+                self._fd = self.stdin.fileno()
+                self._saved_mode = termios.tcgetattr(self._fd)
+                mode = termios.tcgetattr(self._fd)
+                mode[3] &= ~(termios.ICANON | termios.ECHO)  # ISIG stays on: Ctrl+C still interrupts
+                mode[6][termios.VMIN], mode[6][termios.VTIME] = 1, 0
+                termios.tcsetattr(self._fd, termios.TCSANOW, mode)
+            except (OSError, ValueError, termios.error) as exc:
+                self.available, self.reason, self._saved_mode = False, f"cannot set terminal mode ({exc})", None
+                return self
+            target = self._read_posix
+        try:
+            self._thread = threading.Thread(target=target, name="mitm-keyboard", daemon=True)
+            self._thread.start()
+        except Exception as exc:  # e.g. no thread available: restore the terminal, keep solving
+            self._thread = None
+            self._restore_mode()
+            self.available, self.reason = False, f"cannot start the key reader ({exc})"
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(2 * self.poll_seconds + 1)
+            self._thread = None
+        self._restore_mode()
+        return False
+
+    def _restore_mode(self):
+        if self._saved_mode is not None:
+            import termios
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_mode)
+            self._saved_mode = None
+
+    def _read_posix(self):
+        import select
+        while not self._stop.is_set():
+            try:
+                ready, _, _ = select.select([self._fd], [], [], self.poll_seconds)
+                data = os.read(self._fd, 32) if ready else b""
+            except (OSError, ValueError):
+                return  # the terminal went away; solving continues without the shortcut
+            for key in data.decode("utf-8", "ignore"):
+                self.handle_key(key)
+
+    def _read_windows(self):
+        import msvcrt
+        while not self._stop.is_set():
+            if msvcrt.kbhit():
+                self.handle_key(msvcrt.getwch())
+            else:
+                self._stop.wait(self.poll_seconds)
+
+
 def _install_sigint(budget):
     def handler(signum, frame):
         if budget.interrupt_requested:
@@ -4835,7 +5084,8 @@ def _install_sigint(budget):
         return None
 
 
-def main(argv=None, *, clock=None):
+def main(argv=None, *, clock=None, keyboard=None):
+    """CLI entry point. ``keyboard`` builds the key reader from the request queue (tests inject one)."""
     parser = build_arg_parser()
     try:
         args = parser.parse_args(argv)
@@ -4857,16 +5107,22 @@ def main(argv=None, *, clock=None):
     _print_startup(config, objective, seed, seed_generated, input_cube)
 
     budget = Budget(config.time_limit, clock or time.monotonic)
+    requests = ManualMitmRequests()
+    control = (keyboard or KeyboardControl)(requests)
     previous_handler = _install_sigint(budget)
     run = None
     forced_stop = False
     try:
-        run = CoevolutionRun(config, input_key, objective, seed, budget=budget, on_improvement=_print_improvement)
-        for line in _library_startup_lines(run):
-            print(line)
-        print(f"Baseline: H={run.baseline.cost} solved={'yes' if run.baseline.solved else 'no'} (0 moves)")
-        result = run.run()
-        run.report_progress_if_stale()
+        # The key reader only queues requests; the terminal mode is restored on every exit path.
+        with control:
+            print(control.status_line())  # after setup, so a failed setup is reported as unavailable
+            run = CoevolutionRun(config, input_key, objective, seed, budget=budget,
+                                 on_improvement=_print_improvement, manual_requests=requests)
+            for line in _library_startup_lines(run):
+                print(line)
+            print(f"Baseline: H={run.baseline.cost} solved={'yes' if run.baseline.solved else 'no'} (0 moves)")
+            result = run.run()
+            run.report_progress_if_stale()
     except KeyboardInterrupt:
         if run is None:
             _print_status(STATUS_INTERRUPTED)
@@ -4879,6 +5135,8 @@ def main(argv=None, *, clock=None):
     finally:
         if previous_handler is not None:
             signal.signal(signal.SIGINT, previous_handler)
+    if requests.pending:
+        print("Manual MITM request not run: the solver stopped before the next generation boundary.")
 
     finalization_started = time.monotonic()
     final = finalize_result(result)

@@ -802,7 +802,7 @@ class ConfigAndCliTests(FinisherTestCase):
             self.assertIn("(--no-mitm turns it off)", output.getvalue())
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 s.main(common + ["--no-mitm"])
-        self.assertIn("Finisher: disabled (--no-mitm)", output.getvalue())
+        self.assertIn("Finisher: automatic attempts disabled (--no-mitm)", output.getvalue())
         self.assertNotIn("[finisher", output.getvalue())
 
     def test_cli_runs_the_finisher_by_default(self):
