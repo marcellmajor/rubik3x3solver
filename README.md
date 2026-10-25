@@ -21,6 +21,7 @@ solution.
 | [test_mitm_finisher.py](test_mitm_finisher.py) | Tests for the meet-in-the-middle finisher (`--mitm`, on by default). |
 | [test_adaptive_recovery.py](test_adaptive_recovery.py) | Tests for the optional adaptive population recovery (`--adaptive-recovery`). |
 | [test_manual_mitm.py](test_manual_mitm.py) | Tests for the manual finisher trigger (pressing M during a run). |
+| [test_best_candidate_display.py](test_best_candidate_display.py) | Tests for the Space shortcut that shows the current best candidate. |
 | [benchmark_coevolution.py](benchmark_coevolution.py), [experiment_coevolution.txt](experiment_coevolution.txt) | Bounded comparison of the two DEAP solvers, and its recorded report. |
 | [pyproject.toml](pyproject.toml), [uv.lock](uv.lock) | Project metadata, dependencies, and the lockfile used by [uv](https://docs.astral.sh/uv/). |
 
@@ -410,8 +411,22 @@ The first attempt in a run builds or loads the solved-side table (see
   the move model. It is checked against the exact number of states at each
   distance, written atomically, and rebuilt when stale or corrupt. A stopped
   build resumes at the next attempt.
-- **Manual trigger:** in an interactive terminal, pressing `M` or `m` (no
-  Enter) requests one attempt on the current best-ever candidate. It prints
+- **Keys during a run:** in an interactive terminal, the startup line says
+  "Press Space to show the current best candidate; M to request MITM."
+  - Space (no Enter) prints the current best-ever candidate under the active
+    fitness, labelled "Current best solution candidate". It shows when it was
+    taken, the fitness and current phase, `H` and solved status, where and
+    how the candidate was found, its moves (or that it is the unchanged input
+    cube) and its cube, coloured and as a Python literal. Repeated presses
+    coalesce.
+  - The display is served at the solver's next cooperative check, usually
+    within moments, even mid-generation or during a MITM attempt, which it
+    does not interrupt. It only reads the candidate: populations, archive,
+    counters, random numbers and scheduling are unchanged, and it never
+    counts as an improvement.
+  - Space and M are independent: neither consumes or blocks the other.
+- **Manual trigger:** pressing `M` or `m` (no Enter) requests one attempt on
+  the current best-ever candidate. It prints
   "Manual MITM requested; will run at the next safe generation boundary."
   and runs when the current generation finishes, so it may wait a while with
   large populations.
@@ -616,6 +631,7 @@ uv run python -m unittest test_population_diversity -v
 uv run python -m unittest test_mitm_finisher -v
 uv run python -m unittest test_adaptive_recovery -v
 uv run python -m unittest test_manual_mitm -v
+uv run python -m unittest test_best_candidate_display -v
 uv run python benchmark_coevolution.py   # ~15 minutes
 ```
 

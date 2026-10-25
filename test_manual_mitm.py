@@ -377,8 +377,8 @@ class FakeKeyboard:
 
     instances = []
 
-    def __init__(self, requests, press=True):
-        self.requests, self.press, self.exited = requests, press, False
+    def __init__(self, requests, display_requests=None, press=True):
+        self.requests, self.display_requests, self.press, self.exited = requests, display_requests, press, False
         FakeKeyboard.instances.append(self)
 
     def status_line(self):

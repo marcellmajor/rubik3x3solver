@@ -46,7 +46,8 @@ persistent_move_block_library_specs.md.
 The CLI also runs a bounded meet-in-the-middle finisher that searches exactly from
 the best-ever candidate once few cubies are misplaced (on by default; ``--no-mitm``).
 In an interactive terminal, pressing M requests one such attempt at the next
-generation boundary, even with ``--no-mitm``.
+generation boundary, even with ``--no-mitm``, and pressing Space prints the
+current best candidate (read-only).
 ``--adaptive-recovery`` adds an optional intervention for persistent stagnation with low
 solution-population diversity, decided at the diversity checks (off by default).
 
@@ -1042,6 +1043,10 @@ class Budget:
         self.started_at = None
         self.deadline = None
         self.interrupt_requested = False
+        # Optional read-only report (pressing Space): served here, on the solver thread, at the
+        # same cooperative points that check the budget. One attribute test when unused.
+        self.display_requests = None
+        self.on_display = None
 
     def start(self):
         self.started_at = self.clock()
@@ -1055,6 +1060,9 @@ class Budget:
         self.interrupt_requested = True
 
     def check(self):
+        display = self.display_requests
+        if display is not None and display.pending:
+            self.on_display()
         if self.interrupt_requested:
             raise SearchInterrupted("SIGINT received")
         if self.deadline is not None and self.clock() >= self.deadline:
@@ -2580,6 +2588,22 @@ def finisher_summary_line(summary):
     return line
 
 
+def best_candidate_lines(snapshot):
+    """Text of a best-candidate display (the CLI adds the coloured cube and its Python form)."""
+    moves = snapshot["moves"]
+    phase = "" if snapshot["objective"] == snapshot["fitness"] else f", current phase {snapshot['objective']}"
+    identity = f"S#{snapshot['uid']}, " if snapshot["uid"] is not None else ""
+    sequence = format_moves(moves) + (" (the unchanged input cube)" if not moves else "")
+    lines = [f"=== Current best solution candidate ({snapshot['when']}) ===",
+             f"    objective {snapshot['fitness']}{phase}: H={snapshot['cost']}, "
+             f"solved: {'yes' if snapshot['solved'] else 'no'}",
+             f"    found in generation {snapshot['found_generation']} via {identity}{snapshot['source']}",
+             f"    moves ({len(moves)}): {sequence}"]
+    if not snapshot["consistent"]:
+        lines.append("    note: the stored endpoint or cost differs from this replay")
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # The cooperative search
 # ---------------------------------------------------------------------------
@@ -2589,12 +2613,17 @@ class CoevolutionRun:
     """One reproducible run: owns its RNG, counters, archive and both populations."""
 
     def __init__(self, config, input_key, objective, seed, *, budget=None, log=None, on_improvement=None,
-                 manual_requests=None):
+                 manual_requests=None, display_requests=None, on_display=None):
         self.config = config
         # Manual finisher requests (pressing M in the CLI): only take()/finish() are used, at
         # generation boundaries; None means no manual control.
         self.manual_requests = manual_requests
         self.manual_finisher_events = []
+        # Best-candidate display (pressing Space): served read-only at budget checks; on_display
+        # receives the snapshot (default: text lines through log).
+        self.display_requests = display_requests
+        self.on_display = on_display
+        self._finisher_running = False
         # Grouped-alternating runs swap between two concrete phase objectives;
         # self.objective always holds the currently active one.
         self._alternating = objective.state_function == "grouped-alternating"
@@ -2619,6 +2648,9 @@ class CoevolutionRun:
         self.seed = seed
         self.rng = random.Random(seed)
         self.budget = budget if budget is not None else Budget(config.time_limit)
+        if display_requests is not None:
+            self.budget.display_requests = display_requests
+            self.budget.on_display = self._service_display
         self.log = log if log is not None else _print_flush
         # Called as on_improvement(run, entry) after every verified new best-ever entry.
         self.on_improvement = on_improvement
@@ -3949,6 +3981,41 @@ class CoevolutionRun:
                  f"H={entry.cost}, {len(entry.active)} moves")
         return self._finisher_run(generation, entry, cache_key, corners, edges, "manual")
 
+    def best_candidate_snapshot(self):
+        """Consistent read-only view of the best-ever candidate under the active objective.
+
+        Replays the stored moves from the original cube (without counters) and costs the result
+        with the pure objective function, so moves, cube and cost belong to one candidate.
+        Touches no population, archive, counter, cache or RNG state.
+        """
+        entry = self.archive
+        cube = replay(self._original, entry.active)
+        key = state_key(cube)
+        cost = self.objective.cost(key)
+        if self._finisher_running:
+            when = f"during a MITM attempt after generation {self.completed_generation}"
+        elif self.partial_generation is not None:
+            when = f"during generation {self.partial_generation}, {self.partial_phase or 'in progress'}"
+        elif self.completed_generation == 0:
+            when = "before generation 1"
+        else:
+            when = f"after generation {self.completed_generation}"
+        return {"when": when, "fitness": self.config.fitness, "objective": self.objective.name, "cost": cost,
+                "solved": is_solved_key(key), "moves": tuple(entry.active), "endpoint": key, "cube": cube,
+                "uid": entry.uid, "source": entry.source, "found_generation": entry.generation,
+                "consistent": key == entry.endpoint and cost == entry.cost}
+
+    def _service_display(self):
+        """Serve a pending Space request now, on the solver thread; reporting only."""
+        if not self.display_requests.take():
+            return
+        snapshot = self.best_candidate_snapshot()
+        if self.on_display is not None:
+            self.on_display(snapshot)
+        else:
+            for line in best_candidate_lines(snapshot):
+                self.log(line)
+
     def _manual_finisher_event(self, generation, status, reason):
         self.manual_finisher_events.append({"generation": generation, "status": status, "reason": reason})
 
@@ -3957,6 +4024,7 @@ class CoevolutionRun:
         config = self.config
         if self.manual_requests is not None:
             self.manual_requests.begin()  # presses during any attempt are ignored, not queued
+        self._finisher_running = True
         remaining = config.mitm_total_seconds - self.finisher_seconds
         summary = {"generation": generation, "trigger": trigger, "source": entry.source, "uid": entry.uid,
                    "active_length": len(entry.active), "corners": corners, "edges": edges,
@@ -4014,6 +4082,7 @@ class CoevolutionRun:
                                   "abandoned": "stopped"}.get(summary["result"], "no usable improvement")
             if self.manual_requests is not None:
                 self.manual_requests.finish()
+            self._finisher_running = False
             self._record_finisher_attempt(cache_key, summary)
             if solved_candidate is not None:  # verified solve: the normal archive path ends the run
                 candidate, suffix = solved_candidate
@@ -4873,6 +4942,16 @@ def _library_summary_lines(report):
     return lines
 
 
+def _print_best_candidate(snapshot):
+    """Space: the current best candidate, its coloured cube and the cube as a Python literal."""
+    print()
+    for line in best_candidate_lines(snapshot):
+        print(line)
+    _print_cube(snapshot["cube"])
+    snapshot["cube"].print_as_python_list()
+    sys.stdout.flush()
+
+
 def _print_improvement(run, entry):
     """New best-ever state as a coloured cube, plus the two best-ranked move blocks right now."""
     print()
@@ -4905,6 +4984,7 @@ def _print_improvement(run, entry):
 
 
 MANUAL_MITM_KEYS = "Mm"
+DISPLAY_KEY = " "
 MANUAL_MITM_ACK = "Manual MITM requested; will run at the next safe generation boundary."
 KEYBOARD_POLL_SECONDS = 0.25  # the reader blocks this long per wait; it never busy-waits
 
@@ -4960,8 +5040,43 @@ class ManualMitmRequests:
         return self._queued.wait(timeout)
 
 
+class DisplayRequests:
+    """Coalescing flag for "show the current best candidate" (pressing Space).
+
+    The keyboard thread calls ``request``; the solver thread reads ``pending`` (a plain
+    attribute, cheap enough for every budget check) and calls ``take`` before reporting.
+    Independent of manual MITM requests: neither consumes or suppresses the other.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.pending = False
+        self._queued = threading.Event()
+
+    def request(self):
+        """Queue one display; False when coalesced into a pending one."""
+        with self._lock:
+            if self.pending:
+                return False
+            self.pending = True
+            self._queued.set()
+            return True
+
+    def take(self):
+        with self._lock:
+            if not self.pending:
+                return False
+            self.pending = False
+            self._queued.clear()
+            return True
+
+    def wait_for_request(self, timeout):
+        return self._queued.wait(timeout)
+
+
 class KeyboardControl:
-    """Single-key reader for the CLI: M or m (no Enter) queues one manual finisher request.
+    """Single-key reader for the CLI: M or m (no Enter) queues one manual finisher request,
+    Space queues a display of the current best candidate.
 
     Runs in a daemon thread and only ever calls ``requests.request()``; it never touches the
     solver. It works only when stdin is an interactive terminal and never reads redirected
@@ -4969,8 +5084,10 @@ class KeyboardControl:
     echo, but Ctrl+C still raises SIGINT) and restored on exit; Windows uses msvcrt.
     """
 
-    def __init__(self, requests, *, stdin=None, out=None, poll_seconds=KEYBOARD_POLL_SECONDS):
+    def __init__(self, requests, *, display_requests=None, stdin=None, out=None,
+                 poll_seconds=KEYBOARD_POLL_SECONDS):
         self.requests = requests
+        self.display_requests = display_requests
         self.stdin = sys.stdin if stdin is None else stdin
         self.out = out if out is not None else (lambda message: print(message, flush=True))
         self.poll_seconds = poll_seconds
@@ -5001,14 +5118,20 @@ class KeyboardControl:
         return True, None
 
     def status_line(self):
+        if self.available and self.display_requests is not None:
+            return ("Keyboard control: Press Space to show the current best candidate; M to request MITM "
+                    "(a bounded attempt that runs once the current generation finishes)")
         if self.available:
             return ("Keyboard control: press M to request a bounded MITM attempt on the current best candidate "
                     "(it runs once the current generation finishes)")
         return f"Keyboard control: unavailable ({self.reason}); the M shortcut is off, solving continues normally"
 
     def handle_key(self, key):
-        """Queue a request for M or m; any other key is ignored."""
-        if key in MANUAL_MITM_KEYS and self.requests.request():
+        """Queue a request for M or m, or a display for Space; any other key is ignored."""
+        if key == DISPLAY_KEY:
+            if self.display_requests is not None:
+                self.display_requests.request()
+        elif key in MANUAL_MITM_KEYS and self.requests.request():
             self.out(MANUAL_MITM_ACK)
 
     def __enter__(self):
@@ -5108,7 +5231,8 @@ def main(argv=None, *, clock=None, keyboard=None):
 
     budget = Budget(config.time_limit, clock or time.monotonic)
     requests = ManualMitmRequests()
-    control = (keyboard or KeyboardControl)(requests)
+    display = DisplayRequests()
+    control = (keyboard or KeyboardControl)(requests, display_requests=display)
     previous_handler = _install_sigint(budget)
     run = None
     forced_stop = False
@@ -5117,7 +5241,8 @@ def main(argv=None, *, clock=None, keyboard=None):
         with control:
             print(control.status_line())  # after setup, so a failed setup is reported as unavailable
             run = CoevolutionRun(config, input_key, objective, seed, budget=budget,
-                                 on_improvement=_print_improvement, manual_requests=requests)
+                                 on_improvement=_print_improvement, manual_requests=requests,
+                                 display_requests=display, on_display=_print_best_candidate)
             for line in _library_startup_lines(run):
                 print(line)
             print(f"Baseline: H={run.baseline.cost} solved={'yes' if run.baseline.solved else 'no'} (0 moves)")
