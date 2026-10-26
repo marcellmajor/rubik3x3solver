@@ -191,6 +191,24 @@ class SolvedSideTableTests(FinisherTestCase):
         fresh.extend()
         self.assertEqual(table.entries, fresh.entries)
 
+    def test_deepest_level_is_counted_not_stored(self):
+        table = s.SolvedSideTable(3)
+        seen = []
+
+        def check():  # observe the next-level frontier while the last level is being built
+            if table._level == 2:
+                seen.append(len(table._next))
+
+        table.extend(check)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {0})
+        self.assertEqual(len(table.entries), sum(s.MITM_HALF_TURN_COUNTS[:4]))
+        self.assertEqual(table._frontier, [])
+
+    def test_exact_counts_cover_a_six_move_table(self):
+        self.assertEqual(s.MITM_HALF_TURN_COUNTS[6], 7618438)  # OEIS A080601
+        self.assertEqual(s.MITM_MAX_DEPTH // 2, len(s.MITM_HALF_TURN_COUNTS) - 1)
+
     def test_preparation_resumes_a_stopped_in_memory_build(self):
         with self.assertRaises(s._FinisherTimeout):
             s.prepare_solved_side_table(3, None, check=mock.Mock(side_effect=[None, s._FinisherTimeout()]))
@@ -302,7 +320,7 @@ class SearchTests(FinisherTestCase):
     def test_depth_ten_finds_the_optimal_ten_move_three_cycle(self):
         key = scramble_of(THREE_CYCLE_SOLUTION)
         table = s.prepare_solved_side_table(5, self.cache)
-        self.assertEqual(len(table.entries), sum(s.MITM_HALF_TURN_COUNTS))
+        self.assertEqual(len(table.entries), sum(s.MITM_HALF_TURN_COUNTS[:6]))
         search = s.mitm_search(key, table, 10, zero_cost, (), 72)
         self.assertIn(search.termination, ("solution found", "exhaustive"))
         self.assertEqual(len(search.solving[0]), 10)
@@ -746,7 +764,7 @@ class RunFinisherTests(FinisherTestCase):
 
 class ConfigAndCliTests(FinisherTestCase):
     def test_validation(self):
-        bad = [dict(mitm="yes"), dict(mitm_depth=0), dict(mitm_depth=11), dict(mitm_depth=2.0),
+        bad = [dict(mitm="yes"), dict(mitm_depth=0), dict(mitm_depth=13), dict(mitm_depth=2.0),
                dict(mitm_trigger_cubies=-1), dict(mitm_trigger_cubies=21), dict(mitm_corners_first_edge_trigger=13),
                dict(mitm_interval=0), dict(mitm_attempt_seconds=0.0), dict(mitm_attempt_seconds=float("nan")),
                dict(mitm_total_seconds=-1.0), dict(mitm_total_seconds=float("inf")), dict(mitm_cache="")]
@@ -754,8 +772,10 @@ class ConfigAndCliTests(FinisherTestCase):
             with self.assertRaises(s.ConfigError, msg=overrides):
                 s.validate_config(s.SearchConfig(**overrides))
         with self.assertRaisesRegex(s.ConfigError, "deeper searches are not supported"):
-            s.validate_config(s.SearchConfig(mitm_depth=12))
+            s.validate_config(s.SearchConfig(mitm_depth=14))
         s.validate_config(s.SearchConfig(mitm=True, mitm_depth=1, mitm_trigger_cubies=0, mitm_cache="x"))
+        for depth in (11, 12):  # a 6-move table and a 6-move forward search
+            s.validate_config(s.SearchConfig(mitm=True, mitm_depth=depth))
 
     def test_cli_defaults_and_cache_options(self):
         parser = s.build_arg_parser()

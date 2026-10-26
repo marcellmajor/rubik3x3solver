@@ -354,7 +354,7 @@ The first attempt in a run builds or loads the solved-side table (see
 - **Search:** a table of every state within `floor(D/2)` moves of solved is
   joined with a breadth-first search to `ceil(D/2)` moves forward from the
   candidate's endpoint, so a finished search finds the shortest solving suffix
-  of at most `D` moves (`--mitm-depth`, 1–10, default 10). States are compared
+  of at most `D` moves (`--mitm-depth`, 1–12, default 10). States are compared
   by exact identity after recolouring to the face centres. The only pruning is
   skipping a second turn of the same face, which is always safe. Worse
   intermediate fitness is never pruned, and the GA's random numbers are never
@@ -401,11 +401,15 @@ The first attempt in a run builds or loads the solved-side table (see
   - The finisher never repeats an attempt on the same endpoint, except one
     whose table preparation was cut short. A cache write that was cut short is
     retried at the next preparation.
-- **Table cache:** the depth-5 table (621,649 states, about 12 MB on disk and
-  about 200 MB in memory) takes about 1.5 s to build and 0.3 s to load. It is
-  built only when the first attempt needs it and kept in memory for later
-  attempts. It is cached at
-  `$XDG_CACHE_HOME/rubik3x3solver/mitm_solved_side_v1_depth5.bin` (else
+- **Table cache:** the depth-5 table used up to `D` = 10 has 621,649 states,
+  about 12 MB on disk and about 200 MB in memory. It takes about 1.5 s to
+  build and 0.3 s to load. Depths 11 and 12 use the depth-6 table: 8,240,087
+  states and a 149 MB file. Measured with PyPy on a 32 GB Mac, it builds in
+  17 s with a 3.1 GB memory peak and loads in 3.7 s. The table is built only
+  when the first attempt needs it and is kept in memory for later attempts.
+  It is cached at
+  `$XDG_CACHE_HOME/rubik3x3solver/mitm_solved_side_v1_depth5.bin` (or
+  `..._depth6.bin`) (else
   `~/.cache/...`); `--mitm-cache-dir DIR` moves it and `--no-mitm-cache` keeps
   it in memory only. The file carries a format version and a fingerprint of
   the move model. It is checked against the exact number of states at each
@@ -466,6 +470,13 @@ takes about 2.9 s with `manhattan`, 3.1 s with `cubie` and 5.1–5.4 s with
 5.9–6.7 s. The 10 s default lets it finish with any of them, and an attempt
 that completes or solves earlier returns at once. The 30 s total then allows
 about five complete attempts per run.
+
+Depth 12 is about 13 times more work. A complete search visits 8,240,086
+forward states, which took 69.7 s with `grouped-cubie` under PyPy and peaked
+at 4.5 GB of memory. In that run it solved a 12-move scramble that depth 10
+cannot solve. The 10 s / 30 s defaults are far too short for that, so raise
+them with depth 11 or 12, for example:
+`--mitm-depth 12 --mitm-attempt-seconds 90 --mitm-total-seconds 300`.
 
 Measured with 200 solutions, 100 blocks, solution capacity 32, block capacity
 16 and 16 contexts, `manhattan`, CPython, 60 s per run, seeds 42–44, and the

@@ -110,7 +110,7 @@ DEFAULT_STAGNATION_GENERATIONS = 100
 
 # Optional bounded meet-in-the-middle finisher (--mitm). Initial engineering defaults,
 # not claims of optimal performance.
-MITM_MAX_DEPTH = 10
+MITM_MAX_DEPTH = 12  # depths 11-12 need a 6-move table (8.2M states) and far longer attempts
 DEFAULT_MITM_DEPTH = 10
 DEFAULT_MITM_TRIGGER_CUBIES = 4
 DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER = 6
@@ -409,16 +409,21 @@ def default_input_cube():
     The spec's original checkpoint from ``solver_deap.py`` is kept in
     ``benchmark_coevolution.CHECKPOINT_KEY``.
     """
-    return Cube(
-                                   "WYRYGRGRY",
-        ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"],
-                                   "WGWRBBGWR",
-    )
+    #return Cube(
+    #                               "WYRYGRGRY",
+    #    ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"],
+    #                               "WGWRBBGWR",
+    #)
     #return Cube(
     #                                "GGGBGWGGG",
     #    [ "RRRRRRRRR", "WWWWWWWGW", "OOOOOOOOO", "YGYYYYYYY", ],
     #                                "BBBYBBBBB"
     #)
+    return Cube(
+                                   "GWYYGBOGO",
+        ["GORGRRYGB", "WBGWWWROR", "WYYGOOBRO", "GWRYYRBRO"],
+                                   "YBWBBYWOB",
+    )
 
 
 def validate_input_cube(cube):
@@ -2223,7 +2228,7 @@ MITM_CACHE_FORMAT = "rubik3x3solver-mitm-solved-side"
 MITM_CACHE_VERSION = 1
 # Exact number of positions at each half-turn distance from solved (OEIS A080601); a
 # breadth-first table must reproduce these counts exactly, which validates builds and loads.
-MITM_HALF_TURN_COUNTS = (1, 18, 243, 3240, 43239, 574908)
+MITM_HALF_TURN_COUNTS = (1, 18, 243, 3240, 43239, 574908, 7618438)
 MITM_CODE_BYTES = 18  # a 54-digit base-6 face-index code is below 2**140
 MITM_SOLVING_ALTERNATIVES = 8
 MITM_FALLBACK_ALTERNATIVES = 32
@@ -2298,6 +2303,7 @@ class SolvedSideTable:
         self._level = 0
         self._frontier = [(_MITM_SOLVED, 0)]
         self._next = []
+        self._next_count = 0
         self._position = 0
 
     def extend(self, check=None):
@@ -2306,24 +2312,32 @@ class SolvedSideTable:
         while self._level < self.depth:
             frontier, next_frontier = self._frontier, self._next
             level = self._level + 1
-            while self._position < len(frontier):
-                if check is not None and self._position % 256 == 0:
-                    check()
-                state, last = frontier[self._position]
-                last_face = _ALLELE_FACE[last]
-                for allele in REAL_MOVES:
-                    if _ALLELE_FACE[allele] == last_face:
-                        continue
-                    child = "".join(_MOVE_TABLES[allele](state))
-                    code = int(child, 6)
-                    if code not in entries:
-                        entries[code] = level * 19 + allele
-                        next_frontier.append((child, allele))
-                self._position += 1
-            if len(next_frontier) != MITM_HALF_TURN_COUNTS[level]:
-                raise ConsistencyError(f"solved-side table has {len(next_frontier)} states at distance {level}, "
+            keep = level < self.depth  # the deepest level is never expanded: count it, don't store its states
+            count = self._next_count
+            try:
+                while self._position < len(frontier):
+                    if check is not None and self._position % 256 == 0:
+                        check()
+                    state, last = frontier[self._position]
+                    last_face = _ALLELE_FACE[last]
+                    for allele in REAL_MOVES:
+                        if _ALLELE_FACE[allele] == last_face:
+                            continue
+                        child = "".join(_MOVE_TABLES[allele](state))
+                        code = int(child, 6)
+                        if code not in entries:
+                            entries[code] = level * 19 + allele
+                            count += 1
+                            if keep:
+                                next_frontier.append((child, allele))
+                    self._position += 1
+            finally:
+                self._next_count = count  # a stopped build resumes with exact progress
+            if count != MITM_HALF_TURN_COUNTS[level]:
+                raise ConsistencyError(f"solved-side table has {count} states at distance {level}, "
                                        f"expected {MITM_HALF_TURN_COUNTS[level]}")
             self._level, self._frontier, self._next, self._position = level, next_frontier, [], 0
+            self._next_count = 0
         self._frontier = []
         self.complete = True
         return True
@@ -2349,16 +2363,17 @@ def save_solved_side_table(table, directory, check=None):
 
     Records follow the table's own order, breadth-first for a built table, so the file is
     deterministic without a sort. ``check`` may raise while the records are serialised (about
-    0.5 s at depth 5); nothing is written then, and the bounded atomic write follows.
+    0.5 s at depth 5, several seconds at depth 6); nothing is written then, and the bounded
+    atomic write follows. Records go straight into one buffer (157 MB at depth 6).
     """
     if not table.complete:
         raise ConsistencyError("an incomplete solved-side table must not be cached")
-    parts = []
+    body = bytearray()
     for index, (code, value) in enumerate(table.entries.items()):
         if check is not None and index % 8192 == 0:
             check()
-        parts.append(code.to_bytes(MITM_CODE_BYTES, "big") + bytes((value,)))
-    body = b"".join(parts)
+        body += code.to_bytes(MITM_CODE_BYTES, "big")
+        body.append(value)
     if check is not None:
         check()
     header = json.dumps({"format": MITM_CACHE_FORMAT, "version": MITM_CACHE_VERSION,
