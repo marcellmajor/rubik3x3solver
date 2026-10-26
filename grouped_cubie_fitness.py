@@ -160,6 +160,12 @@ class GroupedCubieTables:
         indices, lower = self._decode(face_indices)
         return 4096 * sum(self._lookup(indices)) + lower
 
+    def components(self, face_indices):
+        """Return ``(pattern sum, cubie distance, misplaced stickers)`` with one decoding."""
+        indices, lower = self._decode(face_indices)
+        cubie, misplaced = divmod(lower, 64)  # lower = 64*cubie + misplaced, misplaced <= 48
+        return sum(self._lookup(indices)), cubie, misplaced
+
     def corner_weighted_cost(self, face_indices, corner_weight):
         """Like :meth:`cost`, but the two corner patterns count ``corner_weight`` times.
 

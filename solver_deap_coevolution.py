@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -86,11 +87,11 @@ from cube import Cube
 # ---------------------------------------------------------------------------
 
 DEFAULT_FITNESS = "grouped-alternating"
-DEFAULT_SOLUTION_POPULATION = 1500
-DEFAULT_BLOCK_POPULATION = 1500
+DEFAULT_SOLUTION_POPULATION = 3000
+DEFAULT_BLOCK_POPULATION = 600
 DEFAULT_SOLUTION_CAPACITY = 88
 DEFAULT_BLOCK_CAPACITY = 24
-DEFAULT_CONTEXT_COUNT = 16
+DEFAULT_CONTEXT_COUNT = 12
 DEFAULT_GENERATIONS = 10000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
 DEFAULT_LOG_EVERY = 10
@@ -145,9 +146,9 @@ RECOVERY_BLOCK_CONSECUTIVE_CHECKS = 2
 RECOVERY_DIVERSITY_FLAGS = ("LOW_UNIQUE_STATES", "DOMINANT_STATE", "LOW_CUBIE_SPREAD")
 
 FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie", "edges",
-                   "cubie-refined", "grouped-cubie", "grouped-corners", "corners-first", "grouped-alternating")
+                   "cubie-refined", "grouped-cubie", "grouped-corners", "corners-first", "grouped-alternating", "mix")
 INTEGER_VALUED_FITNESS = ("manhattan", "manhattan-min", "misplaced", "cubie", "edges", "cubie-refined",
-                          "corners-first", "grouped-cubie", "grouped-corners", "grouped-alternating")
+                          "corners-first", "grouped-cubie", "grouped-corners", "grouped-alternating", "mix")
 
 # Grouped-alternating toggles its phase after this many generations without a
 # cube-quality (solved, H) improvement (in addition to its completion switches).
@@ -687,6 +688,45 @@ def grouped_corners_cost(key):
     return _grouped_cubie_tables().corner_weighted_cost(_face_indices(key), GROUPED_CORNER_PATTERN_WEIGHT)
 
 
+@lru_cache(maxsize=None)
+def mix_multipliers():
+    """Per-primitive multipliers L / max for ``mix``, with L the lcm of the five upper bounds.
+
+    Bounds: manhattan 336 (8 non-centre stickers of each colour on the worst colour-to-face
+    assignment), misplaced 48 stickers, cubie 52 (8 corners x 2 + 12 edges x 3), 20 wrong
+    cubies, pattern sum 38 (the five group maxima). Every term therefore spans 0..L exactly,
+    so the five count equally while the cost stays an exact integer.
+    """
+    from grouped_cubie_fitness import UNREACHED
+    colours = sorted(_COLOR_DISTANCE)
+    worst = max(sum(_COLOR_DISTANCE[face][colour] for face, colour in zip(colours, order))
+                for order in itertools.permutations(colours))
+    maxima = {
+        "manhattan": 8 * worst,
+        "misplaced": STICKER_COUNT - 6,
+        "cubie": sum(max(table.values()) for _, table in _CUBIE_TABLES),
+        "edges": len(_CUBIE_TABLES),
+        "pattern": sum(max(distance for distance in table if distance != UNREACHED)
+                       for table in _grouped_cubie_tables()._distance_tables),
+    }
+    scale = math.lcm(*maxima.values())
+    return {name: scale // maximum for name, maximum in maxima.items()}, maxima, scale
+
+
+def mix_cost(key):
+    """Unweighted mix of the five state primitives, each scaled by its upper bound.
+
+    L * (manhattan/336 + misplaced/48 + cubie/52 + wrong cubies/20 + pattern sum/38), as an
+    exact integer (L = 414960). Zero exactly when solved. A sum: a gain in one primitive can
+    be offset by a loss in another.
+    """
+    multipliers, _, _ = mix_multipliers()
+    pattern, cubie, misplaced = _grouped_cubie_tables().components(_face_indices(key))
+    return (multipliers["manhattan"] * manhattan_cost(key) + multipliers["misplaced"] * misplaced
+            + multipliers["cubie"] * cubie + multipliers["edges"] * edge_cost(key)
+            + multipliers["pattern"] * pattern)
+
+
 @dataclass(frozen=True)
 class Objective:
     name: str
@@ -723,6 +763,8 @@ class Objective:
             return corners_first_cost(key)
         if self.state_function == "edges":
             return edge_cost(key)
+        if self.state_function == "mix":
+            return mix_cost(key)
         value = self.manhattan_weight * manhattan_cost(key) + self.misplaced_weight * misplaced_cost(key)
         if not math.isfinite(value):
             raise NumericalError(f"non-finite state cost {value!r}")
@@ -760,6 +802,12 @@ class Objective:
         if self.state_function == "edges":
             return (f"{self.name}: blocks around the centres (8 corners, 12 edges) "
                     "not showing all their correct colours")
+        if self.state_function == "mix":
+            _, maxima, scale = mix_multipliers()
+            return (f"{self.name}: manhattan/{maxima['manhattan']} + misplaced/{maxima['misplaced']} + "
+                    f"cubie/{maxima['cubie']} + wrong cubies/{maxima['edges']} + pattern/{maxima['pattern']}, "
+                    f"each scaled to 0..{scale} so they count equally (exact integer; a sum, so a gain in one "
+                    "term can be offset by a loss in another)")
         alias =" (compatibility alias of manhattan)" if self.name == "manhattan-min" else ""
         return (f"{self.name}{alias}: colour/face-offset mismatch heuristic "
                 "(not a geometric distance, not a lower bound)")
@@ -775,7 +823,7 @@ def make_objective(name, manhattan_weight=None, misplaced_weight=None):
                               "--fitness manhattan-misplaced")
         return Objective(name, name if name in ("misplaced", "cubie", "edges", "cubie-refined",
                                                "grouped-cubie", "grouped-corners",
-                                               "corners-first", "grouped-alternating") else "manhattan")
+                                               "corners-first", "grouped-alternating", "mix") else "manhattan")
     weights = []
     for label, value, default in (
         ("manhattan", manhattan_weight, DEFAULT_MANHATTAN_WEIGHT),
@@ -2727,7 +2775,8 @@ class CoevolutionRun:
         self.history = tools.Logbook()
 
         self._last_report_marker = None
-        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie", "grouped-corners", "corners-first", "grouped-alternating"):
+        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie", "grouped-corners", "corners-first",
+                                        "grouped-alternating", "mix"):
             validate_cubie_input(input_key)
         baseline = self.normalize_solution((), check_budget=False)
         self.baseline = baseline
@@ -5247,7 +5296,8 @@ def main(argv=None, *, clock=None, keyboard=None):
         objective = validate_config(config)
         input_cube = default_input_cube()
         input_key = validate_input_cube(input_cube)
-        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie", "grouped-corners", "corners-first", "grouped-alternating"):
+        if objective.state_function in ("cubie", "cubie-refined", "grouped-cubie", "grouped-corners", "corners-first",
+                                        "grouped-alternating", "mix"):
             validate_cubie_input(input_key)
     except (ConfigError, InvalidInputError) as exc:
         _print_status(STATUS_INVALID_INPUT, f"Invalid configuration or input: {exc}")

@@ -22,6 +22,7 @@ solution.
 | [test_adaptive_recovery.py](test_adaptive_recovery.py) | Tests for the optional adaptive population recovery (`--adaptive-recovery`). |
 | [test_manual_mitm.py](test_manual_mitm.py) | Tests for the manual finisher trigger (pressing M during a run). |
 | [test_best_candidate_display.py](test_best_candidate_display.py) | Tests for the Space shortcut that shows the current best candidate. |
+| [test_mix_fitness.py](test_mix_fitness.py) | Tests for the scaled five-primitive `mix` fitness. |
 | [benchmark_coevolution.py](benchmark_coevolution.py), [experiment_coevolution.txt](experiment_coevolution.txt) | Bounded comparison of the two DEAP solvers, and its recorded report. |
 | [pyproject.toml](pyproject.toml), [uv.lock](uv.lock) | Project metadata, dependencies, and the lockfile used by [uv](https://docs.astral.sh/uv/). |
 
@@ -206,6 +207,8 @@ The formulas use these quantities:
   three groups of four edges. Each group is solved jointly, ignoring pieces
   outside that group. Distances use all 18 face turns; a half turn such as
   `R2` counts as one move.
+- `W`: wrong cubies, the number of corners and edges not in their home slot
+  with the right orientation (0–20; the `edges` cost).
 
 | `--fitness` value | Cost `H` | What it rewards | Limitations / interpretation |
 |---|---|---|---|
@@ -220,6 +223,7 @@ The formulas use these quantities:
 | `grouped-alternating` **(default)** | phases of `grouped-corners` / `grouped-cubie` | Starts as `grouped-corners`; switches to `grouped-cubie` once a best-ever cube that arrived in the current phase has every corner home, back once one has every edge home, never switches before a phase has run 100 generations (`DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS`), and toggles phase after more than 500 generations without a cube-quality (solved, H) improvement — a shorter sequence at equal H does not count. Archive and population are re-scored at each switch; switches are printed as they happen and listed in the final report. | H values before and after a switch are on different scales and not directly comparable. Experimental: intended to break long stagnation plateaus by changing what selection rewards. |
 | `corners-first` | `37 * C + E` | Corner distance first; edge distance breaks ties at every corner score. | Strict priority because `E <= 36`. Edges contribute even before corners are home. Once corners are solved, useful edge sequences may temporarily disturb them, so complete multi-move proposals matter. |
 | `edges` | Number of incorrectly positioned or oriented cubies (0–20) | Increasing the number of completely correct pieces. | Despite its name, includes **both eight corners and twelve edges**. Each wrong piece contributes one regardless of its distance home, so the score is coarse and can saturate. |
+| `mix` | `L * (D/336 + M/48 + S/52 + W/20 + P/38)`, `L` = 414,960 | Any of the five primitives improving: colour-offset mismatch `D`, misplaced stickers `M`, cubie distance `S`, wrong cubies `W` and the grouped pattern distance `P`. Each is scaled by its upper bound so all five count equally; the result is an exact integer, 0 only when solved. | A sum, not a priority order: a gain in one term can be offset by a loss in another. The bounds are worst cases over colour-valid cubes, so real scrambles use only part of each range. Costs about as much as `grouped-cubie`. |
 
 These costs are selection heuristics; do not treat their values as certified
 remaining-move counts or admissible lower bounds. None guarantees convergence
@@ -653,6 +657,7 @@ uv run python -m unittest test_mitm_finisher -v
 uv run python -m unittest test_adaptive_recovery -v
 uv run python -m unittest test_manual_mitm -v
 uv run python -m unittest test_best_candidate_display -v
+uv run python -m unittest test_mix_fitness -v
 uv run python benchmark_coevolution.py   # ~15 minutes
 ```
 
