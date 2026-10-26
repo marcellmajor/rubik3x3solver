@@ -209,7 +209,7 @@ The formulas use these quantities:
 
 | `--fitness` value | Cost `H` | What it rewards | Limitations / interpretation |
 |---|---|---|---|
-| `manhattan` **(default)** | `D` | Reducing sticker colour-offset mismatches. | Cheap legacy heuristic; its fixed colour layout does not model cube move distance or interactions between pieces. |
+| `manhattan` | `D` | Reducing sticker colour-offset mismatches. | Cheap legacy heuristic; its fixed colour layout does not model cube move distance or interactions between pieces. |
 | `manhattan-min` | `D` | Exactly the same states and ordering as `manhattan`. | Compatibility alias; it does not perform an additional minimum-distance search. |
 | `misplaced` | `M` | Putting more stickers on faces with matching centre colours. | Simple count with many ties; one wrong sticker counts equally regardless of how hard it is to correct. |
 | `manhattan-misplaced` | `wD * D + wM * M` | A configurable trade-off between colour-offset mismatch and misplaced-sticker count. Both weights default to `1.0`. | Weighted sum, not strict priority: an improvement in one component can compensate for worsening the other. |
@@ -217,7 +217,7 @@ The formulas use these quantities:
 | `cubie-refined` | `64 * S + M` | Cubie distance first; fewer misplaced stickers breaks ties. | Strict priority because `M <= 48 < 64`. Adds discrimination within cubie ties but cannot accept a worse cubie sum in exchange for fewer misplaced stickers. |
 | `grouped-cubie` | `4096 * P + 64 * S + M` | Joint four-piece distances first, individual cubie distances second, misplaced stickers third. | Captures interactions within each group. Priority is strict; the sum across groups is still a heuristic. Requires additional pattern tables and scoring work. |
 | `grouped-corners` | `4096 * (2 * Pc + Pe) + 64 * S + M` | Like `grouped-cubie`, but the two four-corner pattern distances (`Pc`) count double against the three edge patterns (`Pe`), so corner progress and preservation weigh more. | Not a strict corner phase: edge gains can still outweigh corner regressions across the tiers. Benchmarked below `grouped-cubie` overall (6/40 vs 11/40 solves in a local 40-run comparison during development — two scrambles × 20 seeds, not a benchmark shipped in this repo), despite ending with corners home far more often. |
-| `grouped-alternating` | phases of `grouped-corners` / `grouped-cubie` | Starts as `grouped-corners`; switches to `grouped-cubie` once a best-ever cube that arrived in the current phase has every corner home, back once one has every edge home, never switches before a phase has run 100 generations (`DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS`), and toggles phase after more than 500 generations without a cube-quality (solved, H) improvement — a shorter sequence at equal H does not count. Archive and population are re-scored at each switch; switches are printed as they happen and listed in the final report. | H values before and after a switch are on different scales and not directly comparable. Experimental: intended to break long stagnation plateaus by changing what selection rewards. |
+| `grouped-alternating` **(default)** | phases of `grouped-corners` / `grouped-cubie` | Starts as `grouped-corners`; switches to `grouped-cubie` once a best-ever cube that arrived in the current phase has every corner home, back once one has every edge home, never switches before a phase has run 100 generations (`DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS`), and toggles phase after more than 500 generations without a cube-quality (solved, H) improvement — a shorter sequence at equal H does not count. Archive and population are re-scored at each switch; switches are printed as they happen and listed in the final report. | H values before and after a switch are on different scales and not directly comparable. Experimental: intended to break long stagnation plateaus by changing what selection rewards. |
 | `corners-first` | `37 * C + E` | Corner distance first; edge distance breaks ties at every corner score. | Strict priority because `E <= 36`. Edges contribute even before corners are home. Once corners are solved, useful edge sequences may temporarily disturb them, so complete multi-move proposals matter. |
 | `edges` | Number of incorrectly positioned or oriented cubies (0–20) | Increasing the number of completely correct pieces. | Despite its name, includes **both eight corners and twelve edges**. Each wrong piece contributes one regardless of its distance home, so the score is coarse and can saturate. |
 
@@ -386,14 +386,19 @@ The first attempt in a run builds or loads the solved-side table (see
   generation 1, so the all-NOOP initial population is never changed. The
   suffix is offered to the block library like any other improving block.
 - **Time:** each attempt's forward search and result processing get
-  `--mitm-attempt-seconds` (10). Table preparation (building or loading the
+  `--mitm-attempt-seconds` (150). Table preparation (building or loading the
   table, writing the cache, and the one-time shortening table) does not count
   toward that limit. All attempts together, preparation included, get
-  `--mitm-total-seconds` (30). Every phase checks these limits, `--time-limit`
+  `--mitm-total-seconds` (600). Every phase checks these limits, `--time-limit`
   and Ctrl+C.
-  - When the attempt time runs out during result processing, the best result
-    processed so far is used. Only its final replay and insertion run after
-    the deadline.
+  - The forward search stops early enough to leave 20% of the attempt time,
+    at most 1 s, for processing what it found. So a search that runs to its
+    deadline still has its results checked.
+  - Any solutions found (at most 8) are always verified, even at the deadline;
+    that takes milliseconds.
+  - When the attempt time runs out while improving paths are being
+    processed, the best result processed so far is used. Only its final
+    replay and insertion run after the deadline.
   - An overall stop discards an unsolved improvement but keeps a solve that
     was already verified.
   - An attempt that runs out of time is reported as "timed out", never as
@@ -467,16 +472,21 @@ The first attempt in a run builds or loads the solved-side table (see
 A complete depth-10 forward search visits 621,648 states. Under CPython it
 takes about 2.9 s with `manhattan`, 3.1 s with `cubie` and 5.1–5.4 s with
 `grouped-cubie` or `grouped-corners`; under PyPy the grouped fitnesses take
-5.9–6.7 s. The 10 s default lets it finish with any of them, and an attempt
-that completes or solves earlier returns at once. The 30 s total then allows
-about five complete attempts per run.
+5.9–6.7 s.
 
 Depth 12 is about 13 times more work. A complete search visits 8,240,086
-forward states, which took 69.7 s with `grouped-cubie` under PyPy and peaked
-at 4.5 GB of memory. In that run it solved a 12-move scramble that depth 10
-cannot solve. The 10 s / 30 s defaults are far too short for that, so raise
-them with depth 11 or 12, for example:
-`--mitm-depth 12 --mitm-attempt-seconds 90 --mitm-total-seconds 300`.
+forward states. With `grouped-cubie` it took 59.3 s under CPython (2.0 GB
+peak memory) and 69.7 s under PyPy (4.5 GB). In those runs it solved a
+12-move scramble that depth 10 cannot solve. Building the depth-6 table took
+11.8 s under CPython and 17.1 s under PyPy.
+
+The defaults, 150 s per attempt and 600 s in total, are limits rather than
+fixed costs: an attempt that completes or solves earlier returns at once.
+- Depth-10 attempts take about 5 s.
+- A complete depth-12 attempt still finishes on a machine about twice as
+  slow as the Apple-silicon Mac measured here.
+- The 600 s total keeps the finisher to 10 minutes per run. On that Mac it
+  is enough for the table and about eight complete depth-12 attempts.
 
 Measured with 200 solutions, 100 blocks, solution capacity 32, block capacity
 16 and 16 contexts, `manhattan`, CPython, 60 s per run, seeds 42–44, and the

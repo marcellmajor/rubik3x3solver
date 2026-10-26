@@ -67,7 +67,8 @@ def scrambled_default_cube():
 
 
 def make_run(input_cube=None, *, seed=1, budget=None, **overrides):
-    config = s.SearchConfig(seed=seed, log_every=10 ** 6, **overrides)
+    # These tests were written for manhattan; pin it so they do not follow the module default.
+    config = s.SearchConfig(**{"fitness": "manhattan", "seed": seed, "log_every": 10 ** 6, **overrides})
     objective = s.validate_config(config)
     cube = s.default_input_cube() if input_cube is None else input_cube
     key = s.validate_input_cube(cube)
@@ -314,9 +315,10 @@ class ObjectiveTests(unittest.TestCase):
                 self.assertEqual(objective.cost(key) == 0, s.is_solved_key(key))
 
     def test_names_resolve_as_documented(self):
-        self.assertEqual(s.DEFAULT_FITNESS, "manhattan")
+        self.assertEqual(s.DEFAULT_FITNESS, "grouped-alternating")
         args = s.build_arg_parser().parse_args([])
-        self.assertEqual(s.validate_config(s.config_from_args(args)).state_function, "manhattan")
+        self.assertEqual(s.validate_config(s.config_from_args(args)).state_function, "grouped-alternating")
+        self.assertEqual(s.SearchConfig().fitness, "grouped-alternating")
         self.assertEqual(s.make_objective("manhattan-min").state_function, "manhattan")
         self.assertEqual(s.make_objective("misplaced").state_function, "misplaced")
         edges = s.make_objective("edges")
@@ -438,7 +440,8 @@ class ObjectiveTests(unittest.TestCase):
         with self.assertRaises(s.InvalidInputError):
             s.run_search(s.SearchConfig(fitness="corners-first", seed=1, generations=0), cube,
                          log=lambda message: None)
-        result = s.run_search(s.SearchConfig(seed=1, generations=0), cube, log=lambda message: None)
+        result = s.run_search(s.SearchConfig(fitness="manhattan", seed=1, generations=0), cube,
+                              log=lambda message: None)
         self.assertEqual(result.status, s.STATUS_BUDGET_EXHAUSTED)
         s.validate_cubie_input(s.validate_input_cube(scrambled("R1 U2 C3 D1")))
 

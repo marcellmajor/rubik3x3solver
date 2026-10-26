@@ -554,6 +554,45 @@ class RunFinisherTests(FinisherTestCase):
             run._finisher_apply(entry, self.fabricated(alternatives=["R3", "R3 D3 C3"]), self.blank_summary(), stop)
         self.assertIs(run.archive, entry)  # an unsolved improvement is dropped after an overall stop
 
+    def test_found_solutions_are_verified_even_at_the_deadline(self):
+        run = self.make_run(after(SOLVED, "R1 U1 C1"))
+        run.budget.start()
+        entry = self.set_archive(run, "C3 L1")
+        search = self.fabricated(solving=["L3 U3 R3"], alternatives=["L3"], termination="timed out")
+        summary = self.blank_summary()
+        candidate, suffix = run._finisher_apply(entry, search, summary, mock.Mock(side_effect=s._FinisherTimeout()))
+        self.assertTrue(candidate.solved)
+        self.assertEqual(summary["result"], "solved")
+        self.assertEqual(summary["processing"], "stopped at the attempt deadline after 1 of 2 candidates")
+
+    def test_a_search_that_runs_to_its_deadline_leaves_time_for_processing(self):
+        run = self.make_run(after(SOLVED, "R1 U1 C1"), mitm_attempt_seconds=0.5)
+        run.budget.start()
+        self.set_archive(run, "C3 L1")
+        seen = {}
+
+        def search_until_deadline(*args, deadline=None, **kwargs):
+            seen["search_seconds"] = deadline - time.monotonic()
+            time.sleep(max(0.0, deadline - time.monotonic()))  # the search uses all the time it is given
+            return self.fabricated(alternatives=["L3"], termination="timed out")
+
+        with mock.patch.object(s, "mitm_search", side_effect=search_until_deadline):
+            summary = run.finisher_attempt(0)
+        self.assertLessEqual(seen["search_seconds"], 0.5 * (1 - s.MITM_PROCESSING_RESERVE_FRACTION) + 1e-3)
+        self.assertEqual((summary["candidates"], summary["candidates_checked"]), (1, 1))  # not cut off
+        self.assertIsNone(summary["processing"])
+        run = self.make_run(after(SOLVED, self.FAR), mitm_attempt_seconds=10.0)
+        run.budget.start()
+        seen.clear()
+
+        def capture(*args, deadline=None, **kwargs):
+            seen["search_seconds"] = deadline - time.monotonic()
+            return self.fabricated()
+
+        with mock.patch.object(s, "mitm_search", side_effect=capture):
+            run.finisher_attempt(0)
+        self.assertAlmostEqual(seen["search_seconds"], 10.0 - s.MITM_PROCESSING_RESERVE_MAX_SECONDS, delta=0.05)
+
     def test_attempt_time_excludes_preparation_but_covers_processing(self):
         run = self.make_run(after(SOLVED, self.FAR), mitm_attempt_seconds=0.2)
         run.budget.start()
@@ -566,7 +605,8 @@ class RunFinisherTests(FinisherTestCase):
 
         def slow_search(*args, deadline=None, **kwargs):
             seen["left"] = deadline - time.monotonic()
-            time.sleep(max(0.0, deadline - time.monotonic()) + 0.01)
+            # Overrun the search deadline by more than the processing reserve (20% of 0.2 s).
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.1)
             return self.fabricated(alternatives=["R3"])
 
         with mock.patch.object(s, "prepare_solved_side_table", side_effect=slow_preparation), \
@@ -783,7 +823,9 @@ class ConfigAndCliTests(FinisherTestCase):
         self.assertEqual((config.mitm, config.mitm_depth, config.mitm_trigger_cubies,
                           config.mitm_corners_first_edge_trigger, config.mitm_interval,
                           config.mitm_attempt_seconds, config.mitm_total_seconds),
-                         (True, 10, 4, 6, 50, 10.0, 30.0))  # the CLI runs the finisher by default
+                         (True, s.DEFAULT_MITM_DEPTH, s.DEFAULT_MITM_TRIGGER_CUBIES,
+                          s.DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER, s.DEFAULT_MITM_INTERVAL,
+                          s.DEFAULT_MITM_ATTEMPT_SECONDS, s.DEFAULT_MITM_TOTAL_SECONDS))  # on by default
         self.assertEqual(config.mitm_cache, os.path.join(os.environ["XDG_CACHE_HOME"], "rubik3x3solver"))
         self.assertFalse(s.config_from_args(parser.parse_args(["--no-mitm"])).mitm)
         self.assertFalse(s.SearchConfig().mitm)  # programmatic callers still opt in
@@ -818,7 +860,7 @@ class ConfigAndCliTests(FinisherTestCase):
         with mock.patch.object(s, "default_input_cube", lambda: s.cube_from_key(after(SOLVED, "R1 U1 C1"))):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 s.main(common)
-            self.assertIn("Finisher: meet-in-the-middle depth 10", output.getvalue())
+            self.assertIn(f"Finisher: meet-in-the-middle depth {s.DEFAULT_MITM_DEPTH}", output.getvalue())
             self.assertIn("(--no-mitm turns it off)", output.getvalue())
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 s.main(common + ["--no-mitm"])

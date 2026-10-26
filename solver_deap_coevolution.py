@@ -85,12 +85,12 @@ from cube import Cube
 # Configuration defaults (section 10)
 # ---------------------------------------------------------------------------
 
-DEFAULT_FITNESS = "manhattan"
-DEFAULT_SOLUTION_POPULATION = 2400
-DEFAULT_BLOCK_POPULATION = 600
-DEFAULT_SOLUTION_CAPACITY = 80
-DEFAULT_BLOCK_CAPACITY = 16
-DEFAULT_CONTEXT_COUNT = 32
+DEFAULT_FITNESS = "grouped-alternating"
+DEFAULT_SOLUTION_POPULATION = 1500
+DEFAULT_BLOCK_POPULATION = 1500
+DEFAULT_SOLUTION_CAPACITY = 88
+DEFAULT_BLOCK_CAPACITY = 24
+DEFAULT_CONTEXT_COUNT = 16
 DEFAULT_GENERATIONS = 10000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
 DEFAULT_LOG_EVERY = 10
@@ -99,7 +99,7 @@ DEFAULT_MISPLACED_WEIGHT = 1.0
 # Grouped-alternating: a phase must run at least this many generations before
 # any switch (completion or stagnation). Early corners-home states are fragile;
 # switching to edge optimisation immediately tends to wreck them.
-DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS = 200
+DEFAULT_ALTERNATING_MIN_PHASE_GENERATIONS = 600
 
 # Solution-population diversity and stagnation checks (solution_population_diversity_specs.md).
 DIVERSITY_CHECK_INTERVAL = 50
@@ -111,14 +111,16 @@ DEFAULT_STAGNATION_GENERATIONS = 100
 # Optional bounded meet-in-the-middle finisher (--mitm). Initial engineering defaults,
 # not claims of optimal performance.
 MITM_MAX_DEPTH = 12  # depths 11-12 need a 6-move table (8.2M states) and far longer attempts
-DEFAULT_MITM_DEPTH = 10
+DEFAULT_MITM_DEPTH = 12
 DEFAULT_MITM_TRIGGER_CUBIES = 4
 DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER = 6
 DEFAULT_MITM_INTERVAL = 50
-# Long enough for a complete depth-10 search with the grouped fitnesses (about 5.4 s under
-# CPython, 6.7 s under PyPy); an attempt that finishes or solves earlier returns at once.
-DEFAULT_MITM_ATTEMPT_SECONDS = 10.0
-DEFAULT_MITM_TOTAL_SECONDS = 30.0
+# Caps, not fixed costs: an attempt that finishes or solves earlier returns at once. A complete
+# depth-12 attempt took 59 s (CPython) to 70 s (PyPy) with grouped-cubie on an Apple-silicon Mac,
+# so 150 s also lets it finish on a machine about twice as slow; depth 10 needs about 5 s. The
+# 600 s total (table preparation included) bounds the finisher at 10 minutes per run.
+DEFAULT_MITM_ATTEMPT_SECONDS = 150.0
+DEFAULT_MITM_TOTAL_SECONDS = 600.0
 
 # Optional adaptive population recovery (--adaptive-recovery). Initial engineering
 # defaults that still need benchmarking, not tuned values.
@@ -2234,6 +2236,10 @@ MITM_SOLVING_ALTERNATIVES = 8
 MITM_FALLBACK_ALTERNATIVES = 32
 MITM_OVER_CAPACITY_ALTERNATIVES = 8
 MITM_ATTEMPT_CACHE_LIMIT = 256
+# Part of each attempt's time kept back from the forward search so its results can still be
+# processed when the search runs to its deadline: 20% of the attempt time, at most 1 s.
+MITM_PROCESSING_RESERVE_FRACTION = 0.2
+MITM_PROCESSING_RESERVE_MAX_SECONDS = 1.0
 _MITM_SOLVED = "".join(str(face) * 9 for face in range(6))
 _MITM_SOLVED_CODE = int(_MITM_SOLVED, 6)
 _HOME_CUBIE_POSES = dict(decode_cubie_poses(REFERENCE_SOLVED_KEY))
@@ -4075,6 +4081,9 @@ class CoevolutionRun:
             # The attempt time covers the forward search and result processing; table
             # preparation above counts only toward the total finishing time.
             deadline = min(time.monotonic() + config.mitm_attempt_seconds, allowance_end)
+            # The search stops early enough to leave time for processing what it found.
+            reserve = min(MITM_PROCESSING_RESERVE_MAX_SECONDS,
+                          MITM_PROCESSING_RESERVE_FRACTION * max(0.0, deadline - time.monotonic()))
 
             def check_deadline():
                 self.budget.check()
@@ -4082,7 +4091,7 @@ class CoevolutionRun:
                     raise _FinisherTimeout()
 
             search = mitm_search(entry.endpoint, table, config.mitm_depth, self.objective.cost, entry.active,
-                                 self.solution_capacity, check=self.budget.check, deadline=deadline)
+                                 self.solution_capacity, check=self.budget.check, deadline=deadline - reserve)
             summary.update(termination=search.termination, forward_depth=search.forward_depth,
                            states=search.states, search_seconds=search.seconds)
             solved_candidate = self._finisher_apply(entry, search, summary, check_deadline)
@@ -4114,9 +4123,11 @@ class CoevolutionRun:
 
         Every retained solving and fallback path is joined, reduced and normalised, and the best
         final rank wins, so a path that fits only after shortening can beat one that fitted at
-        once. ``check`` runs before each candidate: at the attempt deadline the best candidate
-        processed so far is used (its archive replay and insertion are the bounded final step).
-        An overall stop discards an unsolved improvement but never an already verified solve.
+        once. Found solutions (at most MITM_SOLVING_ALTERNATIVES, a bounded few milliseconds) are
+        always verified. ``check`` runs before each fallback candidate: at the attempt deadline
+        the best candidate processed so far is used (its archive replay and insertion are the
+        bounded final step). An overall stop discards an unsolved improvement but never a
+        verified solve.
         """
         capacity = self.solution_capacity
         candidates = ([(True, suffix) for suffix in search.solving]
@@ -4126,7 +4137,8 @@ class CoevolutionRun:
         solving_over_capacity = False
         try:
             for order, (solving, suffix) in enumerate(candidates):
-                check()
+                if not solving:
+                    check()
                 summary["candidates_checked"] = order + 1
                 proposal, reduced = self._finisher_reduce(entry, suffix)
                 if len(reduced) > capacity:
@@ -4741,7 +4753,8 @@ def build_arg_parser():
     finisher.add_argument("--mitm-interval", type=int, default=DEFAULT_MITM_INTERVAL,
                           help=f"minimum completed generations between attempts (default {DEFAULT_MITM_INTERVAL})")
     finisher.add_argument("--mitm-attempt-seconds", type=float, default=DEFAULT_MITM_ATTEMPT_SECONDS,
-                          help=f"forward-search time per attempt (default {DEFAULT_MITM_ATTEMPT_SECONDS:g})")
+                          help="time per attempt for the forward search and result processing; table preparation "
+                               f"counts only toward the total (default {DEFAULT_MITM_ATTEMPT_SECONDS:g})")
     finisher.add_argument("--mitm-total-seconds", type=float, default=DEFAULT_MITM_TOTAL_SECONDS,
                           help="total finishing time per run, including table preparation "
                                f"(default {DEFAULT_MITM_TOTAL_SECONDS:g})")

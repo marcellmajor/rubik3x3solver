@@ -383,7 +383,8 @@ class NoAlgorithmChangeTests(unittest.TestCase):
 class SideEffectTests(unittest.TestCase):
     def test_manhattan_checks_build_no_pattern_tables(self):
         code = ("import sys; sys.path.insert(0, %r); import solver_deap_coevolution as s\n"
-                "config = s.SearchConfig(seed=1, generations=50, solution_population=20, block_population=20,\n"
+                "config = s.SearchConfig(fitness='manhattan', seed=1, generations=50, solution_population=20,\n"
+                "                        block_population=20,\n"
                 "                        solution_capacity=16, block_capacity=8, contexts=6)\n"
                 "result = s.run_search(config, log=lambda m: None)\n"
                 "assert len(result.diversity_records) == 1\n"
