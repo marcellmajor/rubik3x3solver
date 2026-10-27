@@ -23,6 +23,7 @@ solution.
 | [test_manual_mitm.py](test_manual_mitm.py) | Tests for the manual finisher trigger (pressing M during a run). |
 | [test_best_candidate_display.py](test_best_candidate_display.py) | Tests for the Space shortcut that shows the current best candidate. |
 | [test_mix_fitness.py](test_mix_fitness.py) | Tests for the scaled five-primitive `mix` fitness. |
+| [test_table_lookup.py](test_table_lookup.py) | Tests for the population-wide solved-side table checks. |
 | [benchmark_coevolution.py](benchmark_coevolution.py), [experiment_coevolution.txt](experiment_coevolution.txt) | Bounded comparison of the two DEAP solvers, and its recorded report. |
 | [pyproject.toml](pyproject.toml), [uv.lock](uv.lock) | Project metadata, dependencies, and the lockfile used by [uv](https://docs.astral.sh/uv/). |
 
@@ -347,9 +348,10 @@ reproducing the plain search exactly. Library callers opt in with
 ### Meet-in-the-middle finisher
 
 The CLI runs an exact, bounded search that tries to finish the best-ever
-candidate once only a few cubies are wrong. Automatic attempts are on by
-default; `--no-mitm` turns them off, and with them off nothing about the
-search changes. Pressing M still requests a single attempt (see **Manual
+candidate once only a few cubies are wrong, and checks the whole population
+against the solved-side table (see **Population table checks** below). Both
+are on by default; `--no-mitm` turns both off, and with them off nothing about
+the search changes. Pressing M still requests a single attempt (see **Manual
 trigger** below). Library
 callers opt in with `SearchConfig(mitm=True)`; it is off by default there.
 The first attempt in a run builds or loads the solved-side table (see
@@ -370,6 +372,31 @@ The first attempt in a run builds or loads the solved-side table (see
   checks once after setup and then after completed generations, at most once per
   `--mitm-interval` (50) generations. It only works from the best-ever
   candidate and skips solved endpoints.
+- **Population table checks:** automatic finishing also looks up every
+  candidate's endpoint in the solved-side table. That covers the best-ever
+  candidate and every candidate in the published population.
+  - Scheduling: the checks need no misplaced-cubie trigger and keep their own
+    schedule. The first runs right after setup, which also loads or builds the
+    table, and then every `--mitm-interval` generations. The trigger above
+    still controls only the forward search.
+  - Hits: a hit means that endpoint is exactly within `floor(D/2)` moves of
+    solved, even if its fitness is poor. A miss rules out only that radius,
+    not the full `D`.
+  - Each distinct endpoint is looked up once, in a fixed order. For a hit,
+    every distinct move sequence that reached it is tried: the table's
+    shortest continuation is joined to the sequence, reduced, capacity-checked
+    and replayed through `cube.py`. Cancellation across the join can make one
+    sequence fit where another does not. The first verified solve ends the
+    run, and its continuation is offered to the block library.
+  - A pass that finds nothing changes nothing: populations, archive, counters
+    and random numbers stay as they were.
+  - Time: the lookups share the boundary's attempt time with any forward
+    search at the same boundary, and count toward `--mitm-total-seconds`.
+  - A manual M request takes the boundary first; the lookups then wait for
+    the next one. `--no-mitm` turns off both the lookups and the automatic
+    forward search.
+  - Each pass prints one `[table lookup gen N]` line, and the final report
+    gives the totals.
 - **Joining:** the suffix is appended to the candidate's moves. The joined
   sequence is simplified across the join, state loops are removed, it is
   shortened, normalised and replayed through `cube.py` before use. Capacity
@@ -658,6 +685,7 @@ uv run python -m unittest test_adaptive_recovery -v
 uv run python -m unittest test_manual_mitm -v
 uv run python -m unittest test_best_candidate_display -v
 uv run python -m unittest test_mix_fitness -v
+uv run python -m unittest test_table_lookup -v
 uv run python benchmark_coevolution.py   # ~15 minutes
 ```
 

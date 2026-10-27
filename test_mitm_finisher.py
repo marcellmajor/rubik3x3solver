@@ -463,7 +463,8 @@ class RunFinisherTests(FinisherTestCase):
         self.assertEqual(len(self.finisher_lines()), 1)
         self.assertIn("solved=yes", self.finisher_lines()[0])
         self.assertGreater(result.finisher_report["preparation_seconds"], 0)
-        self.assertEqual(result.finisher_report["table_source"], "built")
+        self.assertEqual(result.finisher_report["lookup_passes"][0]["table_source"], "built")  # first boundary
+        self.assertEqual(result.finisher_report["table_source"], "memory")  # reused by the forward attempt
 
     def test_simplification_across_the_join(self):
         run = self.make_run(after(SOLVED, "R1 U1 C1"))
@@ -780,14 +781,20 @@ class RunFinisherTests(FinisherTestCase):
         common = dict(fitness="manhattan", seed=5, generations=6, solution_population=20, block_population=20,
                       solution_capacity=16, block_capacity=8, contexts=6, min_block_gain=1.0, log_every=10,
                       block_library=None)
-        for overrides in (dict(mitm=False), dict(mitm=True, mitm_trigger_cubies=0)):
+        for overrides in (dict(mitm=False), dict(mitm=True, mitm_trigger_cubies=0, mitm_depth=4)):
             config = s.SearchConfig(**common, mitm_cache=self.cache, **overrides)
             run = s.CoevolutionRun(config, key, s.validate_config(config), 5, log=lambda message: None)
             result = run.run()
             self.assertEqual(search_digest(run, result), PRE_FEATURE_DIGESTS["manhattan"])
-            self.assertEqual(result.finisher_report["attempts"], [])
-            self.assertEqual(s._SOLVED_SIDE_TABLES, {})
-            self.assertFalse(os.path.exists(self.cache))
+            self.assertEqual(result.finisher_report["attempts"], [])  # the trigger never fires
+            if config.mitm:  # the population table checks bypass the trigger but change nothing here
+                passes = result.finisher_report["lookup_passes"]
+                self.assertEqual([lookup["generation"] for lookup in passes], [0])
+                self.assertEqual(passes[0]["hits"], 0)
+            else:  # --no-mitm: no table work at all
+                self.assertEqual(result.finisher_report["lookup_passes"], [])
+                self.assertEqual(s._SOLVED_SIDE_TABLES, {})
+                self.assertFalse(os.path.exists(self.cache))
 
     def test_an_unproductive_attempt_does_not_touch_the_ga_random_stream(self):
         key = after(SOLVED, "R2 B2 D1 R2 U1 C2 D2 C1 U3 L1")
@@ -861,7 +868,7 @@ class ConfigAndCliTests(FinisherTestCase):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 s.main(common)
             self.assertIn(f"Finisher: meet-in-the-middle depth {s.DEFAULT_MITM_DEPTH}", output.getvalue())
-            self.assertIn("(--no-mitm turns it off)", output.getvalue())
+            self.assertIn("(--no-mitm turns both off)", output.getvalue())
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 s.main(common + ["--no-mitm"])
         self.assertIn("Finisher: automatic attempts disabled (--no-mitm)", output.getvalue())

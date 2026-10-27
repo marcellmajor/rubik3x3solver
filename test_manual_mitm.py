@@ -453,7 +453,7 @@ class CliTests(ManualTestCase):
     def test_help_explains_no_mitm_and_m(self):
         help_text = " ".join(s.build_arg_parser().format_help().split())
         self.assertIn("pressing M", help_text)
-        self.assertIn("--no-mitm turns them off", help_text)
+        self.assertIn("--no-mitm turns both off", help_text)
 
 
 if __name__ == "__main__":

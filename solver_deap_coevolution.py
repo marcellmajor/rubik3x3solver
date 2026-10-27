@@ -2673,6 +2673,21 @@ def best_candidate_lines(snapshot):
     return lines
 
 
+def table_lookup_line(summary):
+    """One line per population table-lookup pass (distinct from a forward MITM attempt)."""
+    line = (f"[table lookup gen {summary['generation']}] radius {summary['radius']} "
+            f"(table {summary['table_source'] or 'not ready'}) | {summary['unique']:,} unique endpoints of "
+            f"{summary['candidates']:,} candidates, scan {summary['scan']} | {summary['hits']} within "
+            f"{summary['radius']} moves | preparation {summary['preparation_seconds']:.2f}s, scan and processing "
+            f"{summary['seconds']:.2f}s | {summary['result']}")
+    if summary["solved"]:
+        line += (f" via {summary['source']}: {summary['source_length']} moves + {summary['continuation_length']}-move "
+                 f"table continuation, combined {summary['combined_before']} -> {summary['combined_after']} moves")
+    if summary["processing"]:
+        line += f" | processing {summary['processing']}"
+    return line
+
+
 # ---------------------------------------------------------------------------
 # The cooperative search
 # ---------------------------------------------------------------------------
@@ -2693,6 +2708,10 @@ class CoevolutionRun:
         self.display_requests = display_requests
         self.on_display = on_display
         self._finisher_running = False
+        # Population-wide exact table lookups (part of automatic MITM), scheduled on their own clock.
+        self._lookup_last_generation = None
+        self._lookup_running = False
+        self.lookup_passes = []
         # Grouped-alternating runs swap between two concrete phase objectives;
         # self.objective always holds the currently active one.
         self._alternating = objective.state_function == "grouped-alternating"
@@ -3964,7 +3983,7 @@ class CoevolutionRun:
 
     # -- meet-in-the-middle finisher (optional, --mitm) ----------------------------------
 
-    def finisher_attempt(self, generation):
+    def finisher_attempt(self, generation, shared_deadline=None):
         """Try to finish the best-ever candidate at a completed-generation boundary (0 = after setup).
 
         Returns the attempt summary, or None when no attempt was due. A verified solve raises
@@ -3998,22 +4017,178 @@ class CoevolutionRun:
             if previous is not None and not previous["retryable"]:
                 # The same search on the same endpoint was already completed or timed out.
                 skip = f"endpoint already searched ({previous['termination']})"
+        if skip is None and shared_deadline is not None and shared_deadline <= time.monotonic():
+            skip = "no attempt time left after this boundary's table lookup"  # tried again next boundary
         self.finisher_skip_reason = skip
         if skip is not None:
             return None
         self.budget.check()  # never start finishing work after an overall stop
         self._finisher_last_attempt = generation
-        return self._finisher_run(generation, entry, cache_key, corners, edges, "automatic")
+        return self._finisher_run(generation, entry, cache_key, corners, edges, "automatic", shared_deadline)
 
     def finisher_boundary(self, generation):
         """At most one finisher attempt per boundary: a pending manual request first, else automatic."""
         requests = self.manual_requests
         if requests is not None and requests.take():
             try:
-                return self.manual_finisher_attempt(generation)
+                return self.manual_finisher_attempt(generation)  # the lookup pass waits for the next boundary
             finally:
                 requests.finish()
-        return self.finisher_attempt(generation)
+        deadline = None
+        if self._lookup_due(generation):
+            # Population table checks first; a forward attempt at this boundary shares their allowance.
+            _, deadline = self.table_lookup_pass(generation)
+        return self.finisher_attempt(generation, shared_deadline=deadline)
+
+    def _lookup_due(self, generation):
+        last = self._lookup_last_generation
+        return (self.config.mitm and not self.archive.solved and self.population is not None
+                and (last is None or generation - last >= self.config.mitm_interval))
+
+    def table_lookup_pass(self, generation):
+        """Exact solved-side table checks for the best-ever and every published candidate.
+
+        Part of automatic MITM: no misplaced-cubie trigger, its own schedule (first at the boundary
+        after setup, then every --mitm-interval generations). A hit is an endpoint exactly within
+        the table radius (floor(D / 2) moves); a miss rules out only that radius. Each hit is joined
+        to its source moves, reduced and verified like a forward result. Returns ``(summary,
+        deadline)``: the per-attempt deadline a forward attempt at this boundary must share (None
+        when the table was not ready). Uses no RNG and changes nothing unless a verified solve
+        ends the run.
+        """
+        config = self.config
+        radius = config.mitm_depth // 2
+        remaining = config.mitm_total_seconds - self.finisher_seconds
+        if remaining <= 0:
+            return None, None
+        self.budget.check()  # never start finishing work after an overall stop
+        self._lookup_last_generation = generation
+        candidates = [self.archive] + list(self.population)
+        summary = {"generation": generation, "radius": radius, "table_source": None, "candidates": len(candidates),
+                   "unique": 0, "hits": 0, "sources_tried": 0, "over_capacity": 0, "scan": "not started",
+                   "processing": None, "result": None, "solved": False, "source": None, "source_length": None,
+                   "continuation_length": None, "combined_before": None, "combined_after": None,
+                   "preparation_seconds": 0.0, "seconds": 0.0}
+        started = time.monotonic()
+        allowance_end = started + remaining
+
+        def check_allowance():
+            self.budget.check()
+            if time.monotonic() >= allowance_end:
+                raise _FinisherTimeout()
+
+        if self.manual_requests is not None:
+            self.manual_requests.begin()
+        self._lookup_running = True
+        solved = None
+        deadline = None
+        try:
+            try:
+                table = prepare_solved_side_table(radius, config.mitm_cache, check_allowance, self.log)
+                _shorten_index(check_allowance)
+            except _FinisherTimeout:
+                summary.update(scan="not started", result="preparation incomplete (table not ready; "
+                                                          "retried at the next scheduled pass)")
+                return summary, None
+            finally:
+                prepared = time.monotonic() - started
+                summary["preparation_seconds"] = prepared
+                self.finisher_preparation_seconds += prepared
+            summary["table_source"] = self.finisher_table_source = table.source
+            deadline = min(time.monotonic() + config.mitm_attempt_seconds, allowance_end)
+
+            def check_deadline():
+                self.budget.check()
+                if time.monotonic() >= deadline:
+                    raise _FinisherTimeout()
+
+            solved = self._lookup_candidates(table, candidates, summary, check_deadline)
+            return summary, deadline
+        except SearchStopped:
+            summary["result"] = "stopped by the run's budget or SIGINT"
+            raise
+        finally:
+            summary["seconds"] = time.monotonic() - started - summary["preparation_seconds"]
+            self.finisher_seconds += time.monotonic() - started
+            if self.manual_requests is not None:
+                self.manual_requests.finish()
+            self._lookup_running = False
+            self.lookup_passes.append(summary)
+            self.log(table_lookup_line(summary))
+            if solved is not None:  # verified solve: the normal archive path ends the run
+                candidate, continuation, source = solved
+                self.offer_to_archive(candidate, uid=None, source=f"table lookup (radius {radius}) from {source}",
+                                      block_payload=continuation)
+
+    def _lookup_candidates(self, table, candidates, summary, check):
+        """Scan distinct endpoints in a fixed order, then try each hit's distinct source sequences.
+
+        Returns ``(candidate, continuation, source)`` for the first verified, capacity-feasible solve,
+        else None. ``check`` bounds scanning and processing; the first source of a hit is always
+        tried, so a found match gets at least one verification.
+        """
+        centres = "".join(self.input_key[start + 4] for start in FACE_STARTS)
+        normalise = str.maketrans(centres, "012345")
+        entries = table.entries
+        seen = set()
+        hits = {}  # endpoint -> [(active, label)], in order of first appearance
+        index = 0
+        try:
+            for index, individual in enumerate(candidates):
+                if index % 256 == 0:
+                    check()
+                endpoint = individual.endpoint
+                if endpoint not in seen:
+                    seen.add(endpoint)
+                    if int(endpoint.translate(normalise), 6) in entries:
+                        hits[endpoint] = []
+                if endpoint in hits:
+                    active = tuple(individual.active)
+                    if all(active != known for known, _ in hits[endpoint]):
+                        if isinstance(individual, ArchiveEntry):
+                            label = (f"the best-ever candidate ({individual.source})" if individual.uid is None
+                                     else f"S#{individual.uid}, the best-ever candidate ({individual.source})")
+                        else:
+                            label = f"S#{individual.uid} ({individual.origin})"
+                        hits[endpoint].append((active, label))
+            summary["scan"] = "completed"
+        except _FinisherTimeout:
+            summary["scan"] = f"interrupted after {index} of {len(candidates)} candidates"
+        summary["unique"], summary["hits"] = len(seen), len(hits)
+        capacity = self.solution_capacity
+        first = True
+        try:
+            for endpoint, sources in hits.items():
+                continuation = table.path_to_solved(endpoint.translate(normalise))
+                for active, label in sources:
+                    if not first:
+                        check()
+                    first = False
+                    summary["sources_tried"] += 1
+                    proposal, reduced = self._join_reduce(active, continuation)
+                    if len(reduced) > capacity:
+                        summary["over_capacity"] += 1
+                        continue
+                    candidate = self.normalize_solution(reduced, check_budget=False)
+                    if not candidate.solved:
+                        raise ConsistencyError("a solved-side table continuation did not solve its endpoint")
+                    summary.update(result="solved", solved=True, source=label, source_length=len(active),
+                                   continuation_length=len(continuation), combined_before=len(proposal),
+                                   combined_after=len(candidate.active))
+                    return candidate, continuation, label
+        except _FinisherTimeout:
+            summary["processing"] = f"stopped at the attempt deadline after {summary['sources_tried']} source(s)"
+        if summary["over_capacity"]:
+            summary["result"] = (f"no usable solve: {summary['over_capacity']} matching source(s) exceed the "
+                                 "solution capacity after reductions")
+        elif hits:
+            summary["result"] = "no usable solve: the attempt time ran out before a match was verified"
+        elif summary["scan"] == "completed":
+            summary["result"] = (f"no endpoint within {summary['radius']} moves (farther ones, up to the "
+                                 f"{self.config.mitm_depth}-move MITM radius, are not ruled out)")
+        else:
+            summary["result"] = "no match among the endpoints checked before the attempt deadline"
+        return None
 
     def manual_finisher_attempt(self, generation):
         """One requested attempt (pressing M) on the best-ever candidate at this boundary.
@@ -4062,7 +4237,9 @@ class CoevolutionRun:
         cube = replay(self._original, entry.active)
         key = state_key(cube)
         cost = self.objective.cost(key)
-        if self._finisher_running:
+        if self._lookup_running:
+            when = f"during a table lookup after generation {self.completed_generation}"
+        elif self._finisher_running:
             when = f"during a MITM attempt after generation {self.completed_generation}"
         elif self.partial_generation is not None:
             when = f"during generation {self.partial_generation}, {self.partial_phase or 'in progress'}"
@@ -4089,7 +4266,7 @@ class CoevolutionRun:
     def _manual_finisher_event(self, generation, status, reason):
         self.manual_finisher_events.append({"generation": generation, "status": status, "reason": reason})
 
-    def _finisher_run(self, generation, entry, cache_key, corners, edges, trigger):
+    def _finisher_run(self, generation, entry, cache_key, corners, edges, trigger, shared_deadline=None):
         """One bounded attempt from ``entry`` (frozen with the current objective for its duration)."""
         config = self.config
         if self.manual_requests is not None:
@@ -4130,6 +4307,8 @@ class CoevolutionRun:
             # The attempt time covers the forward search and result processing; table
             # preparation above counts only toward the total finishing time.
             deadline = min(time.monotonic() + config.mitm_attempt_seconds, allowance_end)
+            if shared_deadline is not None:  # this boundary's table lookup already used part of it
+                deadline = min(shared_deadline, allowance_end)
             # The search stops early enough to leave time for processing what it found.
             reserve = min(MITM_PROCESSING_RESERVE_MAX_SECONDS,
                           MITM_PROCESSING_RESERVE_FRACTION * max(0.0, deadline - time.monotonic()))
@@ -4164,7 +4343,10 @@ class CoevolutionRun:
 
     def _finisher_reduce(self, entry, suffix):
         """Join the candidate and suffix, then simplify across the join, cut state loops and shorten."""
-        proposal = tuple(entry.active) + tuple(suffix)
+        return self._join_reduce(entry.active, suffix)
+
+    def _join_reduce(self, active, suffix):
+        proposal = tuple(active) + tuple(suffix)
         return proposal, shorten_sequence(self._remove_state_loops(simplify(proposal)))
 
     def _finisher_apply(self, entry, search, summary, check):
@@ -4272,6 +4454,7 @@ class CoevolutionRun:
         return {"enabled": self.config.mitm, "attempts": list(self.finisher_attempts),
                 "manual_attempts": sum(1 for attempt in self.finisher_attempts if attempt["trigger"] == "manual"),
                 "manual_events": list(self.manual_finisher_events),
+                "lookup_passes": list(self.lookup_passes),
                 "seconds": self.finisher_seconds, "preparation_seconds": self.finisher_preparation_seconds,
                 "table_source": self.finisher_table_source}
 
@@ -4784,12 +4967,15 @@ def build_arg_parser():
         "meet-in-the-middle finisher",
         "Exact search from the best-ever candidate when few cubies are misplaced: a solved-side "
         "table to floor(D/2) moves joined with a forward search to ceil(D/2) moves. Automatic "
-        "attempts are on by default; --no-mitm turns them off. In an interactive terminal, pressing M "
-        "(no Enter) requests one bounded attempt on the current best candidate at the next generation "
-        "boundary, even with --no-mitm; it uses the same depth and time limits.")
+        "finishing also checks every candidate in the population against the table (an exact "
+        "lookup within floor(D/2) moves, no misplaced-cubie trigger) every --mitm-interval "
+        "generations; the trigger still controls the forward search. Both are on by default; "
+        "--no-mitm turns both off. In an interactive terminal, pressing M (no Enter) requests one "
+        "bounded attempt on the current best candidate at the next generation boundary, even with "
+        "--no-mitm; it uses the same depth and time limits.")
     finisher.add_argument("--mitm", action=argparse.BooleanOptionalAction, default=True,
-                          help="run automatic finisher attempts (default: on; --no-mitm turns them off; "
-                               "pressing M still requests one)")
+                          help="run automatic finishing: forward attempts and population table checks "
+                               "(default: on; --no-mitm turns both off; pressing M still requests one attempt)")
     finisher.add_argument("--mitm-depth", type=int, default=DEFAULT_MITM_DEPTH,
                           help=f"total search depth D, 1-{MITM_MAX_DEPTH} (default {DEFAULT_MITM_DEPTH})")
     finisher.add_argument("--mitm-trigger-cubies", type=int, default=DEFAULT_MITM_TRIGGER_CUBIES,
@@ -4918,9 +5104,11 @@ def _print_startup(config, objective, seed, seed_generated, input_cube):
               f"attempt at <={config.mitm_trigger_cubies} misplaced cubies"
               + (f" or corners home and <={config.mitm_corners_first_edge_trigger} edges"
                  if objective.state_function == "corners-first" else "")
-              + f", every >={config.mitm_interval} generations; {config.mitm_attempt_seconds:g}s per attempt, "
+              + f", every >={config.mitm_interval} generations; plus exact table checks of the whole "
+              f"population (within {depth // 2} moves, no misplaced-cubie trigger) every {config.mitm_interval} "
+              f"generations; {config.mitm_attempt_seconds:g}s per boundary, "
               f"{config.mitm_total_seconds:g}s total including table preparation; cache "
-              f"{config.mitm_cache or 'memory only'} (--no-mitm turns it off)")
+              f"{config.mitm_cache or 'memory only'} (--no-mitm turns both off)")
     else:
         print("Finisher: automatic attempts disabled (--no-mitm)")
     if config.adaptive_recovery:
@@ -4967,6 +5155,12 @@ def _print_final(result, final, finalization_seconds):
         unrun = [event for event in report["manual_events"] if event["status"] != "started"]
         for event in unrun:
             print(f"    manual request at generation {event['generation']} {event['status']}: {event['reason']}")
+        lookups = report["lookup_passes"]
+        if lookups:
+            print(f"    population table checks: {len(lookups)} pass(es), "
+                  f"{sum(lookup['unique'] for lookup in lookups):,} endpoints checked, "
+                  f"{sum(lookup['hits'] for lookup in lookups)} within {lookups[-1]['radius']} moves, "
+                  f"{sum(1 for lookup in lookups if lookup['solved'])} solve(s)")
     if result.objective_switches:
         switches = "; ".join(f"gen {switch['generation']}: {switch['from']} -> {switch['to']} "
                              f"({switch['reason']})" for switch in result.objective_switches)

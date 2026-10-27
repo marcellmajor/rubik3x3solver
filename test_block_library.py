@@ -363,7 +363,8 @@ class DisabledTests(LibraryTestCase):
 
     @mock.patch.object(s, "default_input_cube", scrambled_default_cube)
     def test_cli_flags(self):
-        args = ["--seed", "7", "--generations", "2", "--solution-population", "20", "--block-population", "20",
+        # --no-mitm: not about the finisher, which would otherwise prepare its table at generation 0.
+        args = ["--no-mitm", "--seed", "7", "--generations", "2", "--solution-population", "20", "--block-population", "20",
                 "--contexts", "6", "--solution-capacity", "16", "--block-capacity", "8"]
         xdg = os.environ["XDG_DATA_HOME"]
         default = os.path.join(xdg, "rubik3x3solver", "move_blocks_v1.json")
