@@ -72,7 +72,7 @@ import threading
 import time
 from bisect import insort
 from collections import Counter, OrderedDict, defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from functools import lru_cache
 from operator import itemgetter
 from typing import Optional
@@ -87,11 +87,11 @@ from cube import Cube
 # ---------------------------------------------------------------------------
 
 DEFAULT_FITNESS = "grouped-alternating"
-DEFAULT_SOLUTION_POPULATION = 3000
-DEFAULT_BLOCK_POPULATION = 600
+DEFAULT_SOLUTION_POPULATION = 500#1200
+DEFAULT_BLOCK_POPULATION = 300#600
 DEFAULT_SOLUTION_CAPACITY = 88
 DEFAULT_BLOCK_CAPACITY = 24
-DEFAULT_CONTEXT_COUNT = 12
+DEFAULT_CONTEXT_COUNT = 16
 DEFAULT_GENERATIONS = 10000
 DEFAULT_MIN_BLOCK_GAIN = 1.0
 DEFAULT_LOG_EVERY = 10
@@ -145,6 +145,11 @@ RECOVERY_BLOCK_MIN_DISTINCT_RATIO = 0.50
 RECOVERY_BLOCK_CONSECUTIVE_CHECKS = 2
 RECOVERY_DIVERSITY_FLAGS = ("LOW_UNIQUE_STATES", "DOMINANT_STATE", "LOW_CUBIE_SPREAD")
 
+# Stagnation restart (--stagnation-restart, on in the CLI): after this many completed generations
+# without a strict best-ever H improvement, one MITM attempt from the best-ever candidate; a search
+# that completes without a strict improvement restarts the GA with a derived seed.
+DEFAULT_RESTART_STAGNATION_GENERATIONS = 500
+
 FITNESS_CHOICES = ("manhattan", "misplaced", "manhattan-misplaced", "manhattan-min", "cubie", "edges",
                    "cubie-refined", "grouped-cubie", "grouped-corners", "corners-first", "grouped-alternating", "mix")
 INTEGER_VALUED_FITNESS = ("manhattan", "manhattan-min", "misplaced", "cubie", "edges", "cubie-refined",
@@ -179,6 +184,7 @@ STATUS_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 STATUS_INVALID_INPUT = "INVALID_INPUT"
 STATUS_INTERRUPTED = "INTERRUPTED"
 STATUS_ERROR = "ERROR"
+STATUS_RESTARTED = "RESTARTED"  # an attempt ended for a stagnation restart; never a final status
 
 EXIT_CODES = {
     STATUS_SOLVED: 0,
@@ -228,6 +234,10 @@ class BudgetExpired(SearchStopped):
 
 class SearchInterrupted(SearchStopped):
     status = STATUS_INTERRUPTED
+
+
+class RestartRequested(Exception):
+    """A stagnation MITM attempt exhausted its depth without a strict improvement: restart the GA."""
 
 
 class SolutionFound(Exception):
@@ -412,21 +422,21 @@ def default_input_cube():
     The spec's original checkpoint from ``solver_deap.py`` is kept in
     ``benchmark_coevolution.CHECKPOINT_KEY``.
     """
-    #return Cube(
-    #                               "WYRYGRGRY",
-    #    ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"],
-    #                               "WGWRBBGWR",
-    #)
+    return Cube(
+                                   "WYRYGRGRY",
+        ["WOGBRGYOR", "RGOWWOYYG", "YWOBOBOOO", "BGBWYRBYB"],
+                                   "WGWRBBGWR",
+    )
     #return Cube(
     #                                "GGGBGWGGG",
     #    [ "RRRRRRRRR", "WWWWWWWGW", "OOOOOOOOO", "YGYYYYYYY", ],
     #                                "BBBYBBBBB"
     #)
-    return Cube(
-                                   "GWYYGBOGO",
-        ["GORGRRYGB", "WBGWWWROR", "WYYGOOBRO", "GWRYYRBRO"],
-                                   "YBWBBYWOB",
-    )
+    #return Cube(               
+    #                               "GOOBGYYGO",
+    #    ["WGRGROYRO", "WWRYWWBOR", "GYYGORBOB", "GBGWYRRRO"],
+    #                               "YWWBBYWBB",
+    #)
 
 
 def validate_input_cube(cube):
@@ -1431,6 +1441,9 @@ class SearchConfig:
     recovery_consecutive_checks: int = DEFAULT_RECOVERY_CONSECUTIVE_CHECKS
     recovery_cooldown_generations: int = DEFAULT_RECOVERY_COOLDOWN_GENERATIONS
     recovery_block_refresh_fraction: float = DEFAULT_RECOVERY_BLOCK_REFRESH_FRACTION
+    # Stagnation restart: on by default in the CLI (--no-stagnation-restart turns it off), opt-in here.
+    stagnation_restart: bool = False
+    restart_stagnation_generations: int = DEFAULT_RESTART_STAGNATION_GENERATIONS
 
 
 def _require_int(name, value, minimum):
@@ -1497,6 +1510,9 @@ def validate_config(config):
             or not 0 <= fraction <= RECOVERY_MAX_BLOCK_REFRESH_FRACTION):
         raise ConfigError(f"recovery block refresh fraction must be a finite number in "
                           f"[0, {RECOVERY_MAX_BLOCK_REFRESH_FRACTION}], got {fraction!r}")
+    if type(config.stagnation_restart) is not bool:
+        raise ConfigError("stagnation restart must be True or False")
+    _require_int("restart stagnation generations", config.restart_stagnation_generations, 1)
     if config.adaptive_recovery and not config.diversity_checks:
         raise ConfigError("adaptive recovery needs the diversity checks it is triggered by; "
                           "drop --no-diversity-checks or disable adaptive recovery")
@@ -1530,6 +1546,7 @@ class RunResult:
     finisher_report: Optional[dict] = None
     recovery_report: Optional[dict] = None
     objective_switches: tuple = ()
+    stagnation_report: Optional[dict] = None
 
 
 @dataclass
@@ -2697,8 +2714,14 @@ class CoevolutionRun:
     """One reproducible run: owns its RNG, counters, archive and both populations."""
 
     def __init__(self, config, input_key, objective, seed, *, budget=None, log=None, on_improvement=None,
-                 manual_requests=None, display_requests=None, on_display=None):
+                 manual_requests=None, display_requests=None, on_display=None, attempt=0, generation_offset=0,
+                 finisher_seconds=0.0):
         self.config = config
+        # Attempt ``attempt`` of a session (0 = the first; later ones follow stagnation restarts). The
+        # generations and finishing time of earlier attempts stay spent: the limits are per session.
+        self.attempt = attempt
+        self.generation_offset = generation_offset
+        self.generation_limit = config.generations - generation_offset
         # Manual finisher requests (pressing M in the CLI): only take()/finish() are used, at
         # generation boundaries; None means no manual control.
         self.manual_requests = manual_requests
@@ -2776,7 +2799,7 @@ class CoevolutionRun:
         self._finisher_queue = []
         self._finisher_cache = OrderedDict()
         self.finisher_attempts = []
-        self.finisher_seconds = 0.0
+        self.finisher_seconds = finisher_seconds  # cumulative over the session's attempts
         self.finisher_preparation_seconds = 0.0
         self.finisher_table_source = None
         self.finisher_skip_reason = None  # why the latest boundary made no attempt
@@ -2790,6 +2813,10 @@ class CoevolutionRun:
         self.recovery_records = []
         self.recovery_seconds = 0.0
         self.recovery_postponements = 0
+        # Stagnation restart state (unused while config.stagnation_restart is False).
+        self._stagnation_since = 0     # boundary of the latest strict H improvement or objective switch
+        self._stagnation_retry_at = 0  # no attempt before this boundary after one that proved nothing
+        self.stagnation_events = []
         self.last_block_summary = None
         self.history = tools.Logbook()
 
@@ -2812,7 +2839,7 @@ class CoevolutionRun:
         self._library_snapshot = None
         self._library_pending = {}
         self._library_flush_requested = False
-        if config.block_library is not None and not baseline.solved and config.generations > 0:
+        if config.block_library is not None and not baseline.solved and self.generation_limit > 0:
             self.library = BlockLibrary(config.block_library, counters=self.counters, report=self.log)
             if self.library.load():
                 self.library_status = "enabled"
@@ -3003,6 +3030,7 @@ class CoevolutionRun:
         if quality_improved:
             self.last_quality_improvement_generation = self.generation_in_progress
             self._phase_last_quality_improvement = self.generation_in_progress
+            self._stagnation_since = self.generation_in_progress
         if block_payload and self.library is not None and self.library.usable:
             self._library_note_payload(tuple(block_payload), self.archive.rank)
         if self.on_improvement is not None:
@@ -3543,6 +3571,8 @@ class CoevolutionRun:
         # clock only; the run-wide improvement counter stays truthful.
         self._phase_last_quality_improvement = generation
         self._phase_start_generation = generation
+        # H values of different formulas are never compared: the stagnation count restarts too.
+        self._stagnation_since = generation
         self._phase_start_endpoint = self.archive.endpoint
         self._objective_switches.append({
             "generation": generation,
@@ -3585,12 +3615,13 @@ class CoevolutionRun:
     def run(self):
         if self.baseline.solved:
             return self._result(STATUS_SOLVED, "the input cube is already solved")
-        self.budget.start()
+        if self.attempt == 0:
+            self.budget.start()  # a restarted attempt keeps the session's clock and time limit
         try:
             self.budget.check()
             self.population = self.initial_solution_population()
             self._record_history(0)
-            if self.config.generations == 0:
+            if self.generation_limit == 0:
                 return self._result(STATUS_BUDGET_EXHAUSTED,
                                     "zero generations requested; block population not created")
             self.partial_generation = 0
@@ -3599,7 +3630,7 @@ class CoevolutionRun:
             self.partial_generation = None
             self.partial_phase = None
             self.finisher_boundary(0)
-            generations = self.config.generations
+            generations = self.generation_limit
             for generation in range(1, generations + 1):
                 self.run_generation(generation, build_next_blocks=generation < generations)
                 # Results found right after setup join generation 1's offspring.
@@ -3626,6 +3657,9 @@ class CoevolutionRun:
         except SolutionFound:
             self._library_final_candidates()
             return self._result(STATUS_SOLVED, "verified solve found")
+        except RestartRequested as restart:
+            self._library_final_candidates()
+            return self._result(STATUS_RESTARTED, str(restart))
         except SearchStopped as stop:
             # No new reference evaluations after a time limit or SIGINT; completed ones are kept.
             return self._result(stop.status, str(stop) or stop.status)
@@ -3688,7 +3722,7 @@ class CoevolutionRun:
                      f"generations since the intervention in generation {last} "
                      f"(cooldown {config.recovery_cooldown_generations})")
             return
-        if generation >= config.generations:
+        if generation >= self.generation_limit:
             return  # no generation left to build with recovery
         if finisher_summary is not None:
             manual = " (manual)" if finisher_summary.get("trigger") == "manual" else ""
@@ -4027,9 +4061,13 @@ class CoevolutionRun:
         return self._finisher_run(generation, entry, cache_key, corners, edges, "automatic", shared_deadline)
 
     def finisher_boundary(self, generation):
-        """At most one finisher attempt per boundary: a pending manual request first, else automatic."""
+        """At most one forward attempt per boundary: a pending manual request first, then a due
+        stagnation attempt, else automatic. A stagnation attempt that waits stays due."""
         requests = self.manual_requests
         if requests is not None and requests.take():
+            if self._stagnation_due(generation):
+                self.log(f"[stagnation gen {self._generation_label(generation)}] MITM deferred to the next "
+                         "boundary: a manual request has priority")
             try:
                 return self.manual_finisher_attempt(generation)  # the lookup pass waits for the next boundary
             finally:
@@ -4038,6 +4076,8 @@ class CoevolutionRun:
         if self._lookup_due(generation):
             # Population table checks first; a forward attempt at this boundary shares their allowance.
             _, deadline = self.table_lookup_pass(generation)
+        if self._stagnation_due(generation):
+            return self.stagnation_finisher_attempt(generation, shared_deadline=deadline)
         return self.finisher_attempt(generation, shared_deadline=deadline)
 
     def _lookup_due(self, generation):
@@ -4226,6 +4266,95 @@ class CoevolutionRun:
                  f"H={entry.cost}, {len(entry.active)} moves")
         return self._finisher_run(generation, entry, cache_key, corners, edges, "manual")
 
+    # -- stagnation restart (optional, --stagnation-restart) -----------------------------
+
+    def _generation_label(self, generation):
+        """``generation`` within this attempt, plus the session-wide count after a restart."""
+        if self.attempt == 0:
+            return str(generation)
+        return f"{generation} of attempt {self.attempt + 1}, cumulative {self.generation_offset + generation}"
+
+    def _stagnation_due(self, generation):
+        config = self.config
+        return (config.stagnation_restart and not self.archive.solved
+                and generation - self._stagnation_since >= config.restart_stagnation_generations
+                and generation >= self._stagnation_retry_at)
+
+    def stagnation_finisher_attempt(self, generation, shared_deadline=None):
+        """One MITM attempt from the best-ever candidate after the configured stalled generations.
+
+        Stagnation is the trigger: the misplaced-cubie trigger, the automatic interval and the
+        same-endpoint suppression are bypassed, and it runs even with --no-mitm. Depth, time limits,
+        interruption, capacity, shortening and verification are those of every attempt. A verified
+        solve ends the run as usual; a strict H improvement continues this population (the archive
+        update restarts the count); a search that exhausted its depth without one raises
+        RestartRequested. Anything else proves nothing: it is reported and retried after another
+        interval. Returns the attempt summary, or None when no attempt ran.
+        """
+        config = self.config
+        entry = self.archive
+        stalled = generation - self._stagnation_since
+        prefix = f"[stagnation gen {self._generation_label(generation)}]"
+        if shared_deadline is not None and shared_deadline <= time.monotonic():
+            self.finisher_skip_reason = "stagnation attempt deferred"
+            self.log(f"{prefix} MITM deferred to the next boundary: this boundary's table lookup used the "
+                     "attempt time")
+            return None
+        self.log(f"{prefix} {stalled} generations without a strict best-ever H improvement (counted from "
+                 f"generation {self._stagnation_since}, trigger {config.restart_stagnation_generations}): MITM "
+                 f"depth {config.mitm_depth} from the best-ever candidate, H={entry.cost}, {len(entry.active)} moves")
+        if config.mitm_total_seconds - self.finisher_seconds <= 0:
+            self.finisher_skip_reason = "stagnation attempt not run"
+            return self._stagnation_inconclusive(generation, entry, stalled, None, "not run: the cumulative "
+                                                 f"finishing time ({config.mitm_total_seconds:g}s, "
+                                                 "--mitm-total-seconds) is spent")
+        self.budget.check()  # never start finishing work after an overall stop
+        try:
+            corners, edges = misplaced_cubies(entry.endpoint)
+        except ValueError:
+            corners = edges = None
+        cache_key = (entry.endpoint, self.objective.identity, self.solution_capacity, config.mitm_depth)
+        try:
+            summary = self._finisher_run(generation, entry, cache_key, corners, edges, "stagnation", shared_deadline)
+        except SolutionFound:
+            self._stagnation_record(generation, entry, stalled, None, "solved", "verified solve")
+            raise
+        if summary["result"] == "improved":
+            detail = f"strict improvement H {entry.cost} -> {summary['result_cost']}"
+            self._stagnation_record(generation, entry, stalled, summary, "improved", detail)
+            self.log(f"{prefix} {detail}; the population continues and the stagnation count restarts at 0")
+            return summary
+        if summary["search_termination"] != "exhaustive" or summary["processing"] is not None:
+            reason = (f"result processing {summary['processing']}" if summary["processing"] is not None
+                      else f"search {summary['termination']}")
+            return self._stagnation_inconclusive(generation, entry, stalled, summary,
+                                                 f"not exhaustive ({reason}); {summary['result']}")
+        detail = (f"the depth-{config.mitm_depth} search was exhausted without a strict H improvement "
+                  f"({summary['result']})")
+        if generation >= self.generation_limit:
+            self._stagnation_record(generation, entry, stalled, summary, "exhausted", detail)
+            self.log(f"{prefix} {detail}; no generations remain for a restart")
+            return summary
+        self._stagnation_record(generation, entry, stalled, summary, "restart", detail)
+        self.log(f"{prefix} {detail}; restarting the GA")
+        raise RestartRequested(f"stagnation restart at generation {self._generation_label(generation)}: {detail}")
+
+    def _stagnation_inconclusive(self, generation, entry, stalled, summary, detail):
+        """No restart on this evidence; the next stagnation attempt waits another interval."""
+        self._stagnation_retry_at = generation + self.config.restart_stagnation_generations
+        self._stagnation_record(generation, entry, stalled, summary, "no restart", detail)
+        self.log(f"[stagnation gen {self._generation_label(generation)}] no restart: {detail}; the next "
+                 f"stagnation attempt waits until generation {self._stagnation_retry_at}")
+        return summary
+
+    def _stagnation_record(self, generation, entry, stalled, summary, outcome, detail):
+        self.stagnation_events.append({
+            "generation": generation, "cumulative_generation": self.generation_offset + generation,
+            "stalled_generations": stalled, "initial_cost": entry.cost, "initial_length": len(entry.active),
+            "search_termination": None if summary is None else summary["search_termination"],
+            "result_cost": None if summary is None else summary["result_cost"],
+            "outcome": outcome, "detail": detail})
+
     def best_candidate_snapshot(self):
         """Consistent read-only view of the best-ever candidate under the active objective.
 
@@ -4277,7 +4406,8 @@ class CoevolutionRun:
                    "active_length": len(entry.active), "corners": corners, "edges": edges,
                    "initial_cost": entry.cost, "depth": config.mitm_depth, "table_depth": config.mitm_depth // 2,
                    "forward_target": config.mitm_depth - config.mitm_depth // 2, "forward_depth": 0, "states": 0,
-                   "termination": None, "result": None, "suffix_length": None, "combined_before": None,
+                   "termination": None, "search_termination": None, "result": None, "suffix_length": None,
+                   "combined_before": None,
                    "combined_after": None, "result_cost": None, "result_solved": False, "archive": False,
                    "population": "-", "preparation_seconds": 0.0, "table_source": None, "search_seconds": 0.0,
                    "candidates": 0, "candidates_checked": 0, "processing": None, "outcome": None,
@@ -4320,7 +4450,8 @@ class CoevolutionRun:
 
             search = mitm_search(entry.endpoint, table, config.mitm_depth, self.objective.cost, entry.active,
                                  self.solution_capacity, check=self.budget.check, deadline=deadline - reserve)
-            summary.update(termination=search.termination, forward_depth=search.forward_depth,
+            summary.update(termination=search.termination, search_termination=search.termination,
+                           forward_depth=search.forward_depth,
                            states=search.states, search_seconds=search.seconds)
             solved_candidate = self._finisher_apply(entry, search, summary, check_deadline)
             return summary
@@ -4673,7 +4804,8 @@ class CoevolutionRun:
             phase = (f" phase={self._current_phase} corners_home={8 - wrong_corners}/8 "
                      f"edges_home={12 - wrong_edges}/12")
         lines = [
-            f"[gen {self.completed_generation} | {self.budget.elapsed():.1f}s] best-ever cost={archive.cost} "
+            f"[gen {self._generation_label(self.completed_generation)} | {self.budget.elapsed():.1f}s] "
+            f"best-ever cost={archive.cost} "
             f"moves={len(archive.active)} solved={'yes' if archive.solved else 'no'}{phase} "
             f"generations since improvement={self.completed_generation - self.last_improvement_generation}",
             f"  solutions: distinct endpoints={len(endpoints)}/{len(population)} "
@@ -4758,17 +4890,198 @@ def _print_cube(cube):
     colorama.deinit()
 
 
+def restart_seed(seed, index):
+    """Seed of restart ``index`` (1, 2, ...) in a session started with ``seed``; the same everywhere."""
+    digest = hashlib.sha256(f"rubik3x3solver stagnation restart {seed} {index}".encode()).digest()
+    return int.from_bytes(digest[:4], "big")
+
+
+@dataclass(frozen=True)
+class EndedAttempt:
+    """What a session keeps of an attempt after its restart: never its populations, caches or library."""
+    seed: int
+    generation_offset: int
+    stagnation_events: tuple
+
+
+class SearchSession:
+    """A solver session: one ordinary fresh CoevolutionRun per attempt.
+
+    An attempt ends early only when its stagnation MITM attempt exhausted the search depth without a
+    strict improvement; the next attempt starts from the same input cube and configuration with a
+    seed derived from the session seed and the restart index. The budget (time limit, SIGINT), the
+    keyboard requests, the generation limit and the cumulative finishing time belong to the session
+    and are never replenished. Module-level tables (solved-side table, shortening index, fitness
+    tables) are immutable and reused.
+    """
+
+    def __init__(self, config, input_key, objective, seed, *, budget=None, log=None, **run_options):
+        self.config = config
+        self.input_key = input_key
+        self.objective = objective
+        self.seed = seed
+        self.budget = budget if budget is not None else Budget(config.time_limit)
+        self._run_log = log
+        self.log = log if log is not None else _print_flush
+        self.run_options = run_options
+        self.finished = []  # (EndedAttempt, result) of the attempts that ended with a restart
+        self.run = CoevolutionRun(config, input_key, objective, seed, budget=self.budget, log=log, **run_options)
+
+    def execute(self):
+        while True:
+            result = self.run.run()
+            if result.status == STATUS_RESTARTED:
+                result = self._restart(result)  # None once the next attempt is ready
+            if result is not None:
+                return self.combined_result(result)
+
+    def interrupted_result(self):
+        """Result for a hard interrupt (second SIGINT) that escaped the budget checks."""
+        del self.finished[self.run.attempt:]  # stopped between recording an attempt and replacing the run
+        return self.combined_result(self.run.interrupted_result())
+
+    def _restart(self, result):
+        """Set up the next attempt and return None, or return the session's final result instead.
+
+        The session ends here, without a restart, when the attempt's best candidate fails
+        independent replay (nothing is saved, and the final verification reports it) or when
+        Ctrl+C or the time limit arrives while the attempt is being finished.
+        """
+        run = self.run
+        run.report_progress_if_stale()
+        index = run.attempt + 1
+        problems = finalize_result(result).problems
+        if problems:
+            self.log(f"[restart {index}] not started: attempt {index}'s best candidate failed replay "
+                     f"({'; '.join(problems)})")
+            return replace(result, status=STATUS_ERROR,
+                           reason=f"{result.reason}; no restart: the best candidate failed replay")
+        try:
+            self.budget.check()
+            # The finished attempt's library submissions go through the normal verified save first.
+            run.finish_block_library()
+            self.budget.check()  # a stop during the save; the caller's final save covers the library
+        except SearchStopped as stop:
+            self.log(f"[restart {index}] not started: {stop}")
+            return replace(result, status=stop.status, reason=f"{stop}; restart {index} not started")
+        used = {run.seed} | {attempt.seed for attempt, _ in self.finished}
+        seed = restart_seed(self.seed, index)
+        while seed in used:
+            seed = (seed + 1) % 2 ** 32
+        offset = run.generation_offset + result.completed_generations
+        entry = result.archive
+        self.log(f"[restart {index}] {result.reason}")
+        self.log(f"[restart {index}] attempt {index} best: H={entry.cost} ({result.objective.name}), "
+                 f"{len(entry.active)} moves. Attempt {index + 1} starts from the original cube with seed {seed}; "
+                 f"used so far: {offset} of {self.config.generations} generations, {self.budget.elapsed():.1f}s, "
+                 f"{run.finisher_seconds:.1f}s of {self.config.mitm_total_seconds:g}s finishing time")
+        next_run = CoevolutionRun(self.config, self.input_key, self.objective, seed, budget=self.budget,
+                                  log=self._run_log, attempt=index, generation_offset=offset,
+                                  finisher_seconds=run.finisher_seconds, **self.run_options)
+        # Only the result and identity are kept: the finished run's populations and caches are released.
+        self.finished.append((EndedAttempt(run.seed, run.generation_offset, tuple(run.stagnation_events)), result))
+        self.run = next_run
+        for line in _library_startup_lines(self.run):
+            self.log(line)
+
+    @staticmethod
+    def _attempt_record(number, run, result):
+        entry = result.archive
+        return {"attempt": number, "seed": run.seed, "first_generation": run.generation_offset + 1,
+                "generations": result.completed_generations, "status": result.status, "reason": result.reason,
+                "objective": result.objective.name, "best_cost": entry.cost, "best_length": len(entry.active),
+                "best_solved": entry.solved, "best_moves": tuple(entry.active)}
+
+    def combined_result(self, last):
+        """The session's result: the last attempt's status and totals, the best candidate of all attempts.
+
+        Candidates of different attempts are compared under the final objective (a switching
+        objective can leave attempts in different phases), so a worse restart never hides an earlier
+        best; finalize_result then verifies the retained candidate as usual. Earlier attempts were
+        verified before their restart; a last candidate that fails replay is reported unchanged
+        instead, so an earlier best never hides that failure either.
+        """
+        attempts = self.finished + [(self.run, last)]
+        report = {"enabled": self.config.stagnation_restart,
+                  "generations": self.config.restart_stagnation_generations,
+                  "restarts": len(self.finished), "seeds": [run.seed for run, _ in attempts],
+                  "attempts": [self._attempt_record(number, run, result)
+                               for number, (run, result) in enumerate(attempts, 1)],
+                  "events": [dict(event, attempt=number) for number, (run, _) in enumerate(attempts, 1)
+                             for event in run.stagnation_events]}
+        if not self.finished:
+            last.stagnation_report = report
+            return last
+        objective = last.objective
+        if finalize_result(last).problems:
+            number, run, entry, cost = len(attempts), self.run, last.archive, last.archive.cost
+        else:
+            best = None
+            for number, (run, result) in enumerate(attempts, 1):
+                entry = result.archive
+                cost = objective.cost(entry.endpoint)
+                rank = (0 if entry.solved else 1, cost, len(entry.active))
+                if best is None or rank < best[0]:
+                    best = (rank, number, run, entry, cost)
+            _, number, run, entry, cost = best
+        archive = replace(entry, cost=cost, generation=run.generation_offset + entry.generation,
+                          source=f"{entry.source} (attempt {number}, seed {run.seed})")
+        counters = SearchCounters()
+        for _, result in attempts:
+            for item in fields(SearchCounters):
+                setattr(counters, item.name, getattr(counters, item.name) + getattr(result.counters, item.name))
+        finisher_reports = [result.finisher_report for _, result in attempts]
+        finisher = dict(finisher_reports[-1])  # its "seconds" already include the earlier attempts
+        for key in ("attempts", "manual_events", "lookup_passes"):
+            finisher[key] = [item for report in finisher_reports for item in report[key]]
+        finisher["manual_attempts"] = sum(report["manual_attempts"] for report in finisher_reports)
+        finisher["preparation_seconds"] = sum(report["preparation_seconds"] for report in finisher_reports)
+        finisher["table_source"] = next((report["table_source"] for report in reversed(finisher_reports)
+                                         if report["table_source"]), None)
+        recovery_reports = [result.recovery_report for _, result in attempts]
+        recovery = dict(recovery_reports[-1])
+        for key in ("interventions", "solution_only", "with_block_refresh", "postponed", "seconds"):
+            recovery[key] = sum(report[key] for report in recovery_reports)
+        recovery["records"] = [record for report in recovery_reports for record in report["records"]]
+        offset = self.run.generation_offset
+        return RunResult(
+            status=STATUS_SOLVED if archive.solved else last.status,
+            reason=last.reason,
+            archive=archive,
+            seed=self.seed,
+            input_key=self.input_key,
+            objective=objective,
+            solution_capacity=last.solution_capacity,
+            completed_generations=offset + last.completed_generations,
+            partial_generation=None if last.partial_generation is None else offset + last.partial_generation,
+            partial_phase=last.partial_phase,
+            search_seconds=last.search_seconds,
+            counters=counters,
+            history=[dict(row, gen=row["gen"] + run.generation_offset) for run, result in attempts
+                     for row in result.history],
+            block_population_created=last.block_population_created,
+            diversity_records=[record for _, result in attempts for record in result.diversity_records],
+            diversity_seconds=sum(result.diversity_seconds for _, result in attempts),
+            finisher_report=finisher,
+            recovery_report=recovery,
+            objective_switches=tuple(dict(switch, generation=run.generation_offset + switch["generation"])
+                                     for run, result in attempts for switch in result.objective_switches),
+            stagnation_report=report,
+        )
+
+
 def run_search(config, input_cube=None, *, budget=None, log=None):
-    """Validate, then run one search; ``input_cube`` defaults to :func:`default_input_cube`."""
+    """Validate, then run one search session; ``input_cube`` defaults to :func:`default_input_cube`."""
     objective = validate_config(config)
     cube = default_input_cube() if input_cube is None else input_cube
     input_key = validate_input_cube(cube)
     seed = config.seed if config.seed is not None else generate_seed()
-    run = CoevolutionRun(config, input_key, objective, seed, budget=budget, log=log)
-    result = run.run()
+    session = SearchSession(config, input_key, objective, seed, budget=budget, log=log)
+    result = session.execute()
     if config.block_library is not None:
         # Persist only after the archived result survives independent replay.
-        result.library_report = run.finish_block_library(allow_save=finalize_result(result).status != STATUS_ERROR)
+        result.library_report = session.run.finish_block_library(
+            allow_save=finalize_result(result).status != STATUS_ERROR)
     return result
 
 
@@ -4938,7 +5251,8 @@ def build_arg_parser():
                            help="warn when the mean number of differing cubies between candidates (0-20) "
                                 "is below this (default 2.0)")
     diversity.add_argument("--stagnation-generations", type=int, default=DEFAULT_STAGNATION_GENERATIONS,
-                           help="warn after this many generations without better (unsolved, H) (default 100)")
+                           help="warn after this many generations without better (unsolved, H) (default 100; "
+                                "the stagnation restart has its own --restart-stagnation-generations)")
     diversity.add_argument("--no-diversity-checks", action="store_true",
                            help="disable diversity measurements and warnings")
     recovery = parser.add_argument_group(
@@ -4972,10 +5286,12 @@ def build_arg_parser():
         "generations; the trigger still controls the forward search. Both are on by default; "
         "--no-mitm turns both off. In an interactive terminal, pressing M (no Enter) requests one "
         "bounded attempt on the current best candidate at the next generation boundary, even with "
-        "--no-mitm; it uses the same depth and time limits.")
+        "--no-mitm; it uses the same depth and time limits. Stagnation attempts (see the stagnation "
+        "restart options) also run with --no-mitm.")
     finisher.add_argument("--mitm", action=argparse.BooleanOptionalAction, default=True,
                           help="run automatic finishing: forward attempts and population table checks "
-                               "(default: on; --no-mitm turns both off; pressing M still requests one attempt)")
+                               "(default: on; --no-mitm turns both off; pressing M still requests one attempt, "
+                               "and stagnation attempts still run unless --no-stagnation-restart)")
     finisher.add_argument("--mitm-depth", type=int, default=DEFAULT_MITM_DEPTH,
                           help=f"total search depth D, 1-{MITM_MAX_DEPTH} (default {DEFAULT_MITM_DEPTH})")
     finisher.add_argument("--mitm-trigger-cubies", type=int, default=DEFAULT_MITM_TRIGGER_CUBIES,
@@ -4999,6 +5315,25 @@ def build_arg_parser():
                             "else ~/.cache/rubik3x3solver)")
     cache.add_argument("--no-mitm-cache", action="store_true",
                        help="build the solved-side table in memory only; never read or write the disk cache")
+    restart = parser.add_argument_group(
+        "stagnation restart",
+        "After --restart-stagnation-generations completed generations without a strict improvement in the "
+        "best-ever H (an equal H with fewer moves does not count; an objective switch restarts the count), "
+        "one MITM attempt runs from the best-ever candidate at the next generation boundary. It bypasses "
+        "the misplaced-cubie trigger, the --mitm-interval schedule and same-endpoint suppression, and runs "
+        "even with --no-mitm, which turns off only the automatic attempts; depth, time limits and "
+        "verification are those of every attempt. A strict improvement continues the population. A search "
+        "that completes without one restarts the whole GA from the original cube with a new seed "
+        "derived from the session seed. A timed-out or otherwise incomplete search never causes a restart; "
+        "the next stagnation attempt then waits another interval. --generations, --time-limit and "
+        "--mitm-total-seconds cover the whole session: restarts do not replenish them.")
+    restart.add_argument("--stagnation-restart", action=argparse.BooleanOptionalAction, default=True,
+                         help="run stagnation MITM attempts and restarts (default: on; --no-stagnation-restart "
+                              "turns both off)")
+    restart.add_argument("--restart-stagnation-generations", type=int,
+                         default=DEFAULT_RESTART_STAGNATION_GENERATIONS,
+                         help="completed generations without a strict best-ever H improvement before a "
+                              f"stagnation MITM attempt (default {DEFAULT_RESTART_STAGNATION_GENERATIONS})")
     return parser
 
 
@@ -5036,6 +5371,8 @@ def config_from_args(args):
         recovery_consecutive_checks=args.recovery_consecutive_checks,
         recovery_cooldown_generations=args.recovery_cooldown_generations,
         recovery_block_refresh_fraction=args.recovery_block_refresh_fraction,
+        stagnation_restart=args.stagnation_restart,
+        restart_stagnation_generations=args.restart_stagnation_generations,
     )
 
 
@@ -5119,6 +5456,13 @@ def _print_startup(config, objective, seed, seed_generated, input_cube):
               f"{RECOVERY_BLOCK_CONSECUTIVE_CHECKS} unhealthy block checks (experimental defaults)")
     else:
         print("Adaptive recovery: disabled")
+    if config.stagnation_restart:
+        print(f"Stagnation restart: after {config.restart_stagnation_generations} generations without a strict "
+              f"best-ever H improvement, one MITM attempt (depth {config.mitm_depth}, also with --no-mitm); a "
+              "search that completes without a strict improvement restarts the GA with a new seed; "
+              "--generations, --time-limit and --mitm-total-seconds cover all attempts")
+    else:
+        print("Stagnation restart: disabled (--no-stagnation-restart)")
 
 
 def _print_final(result, final, finalization_seconds):
@@ -5172,6 +5516,19 @@ def _print_final(result, final, finalization_seconds):
               f"{recovery['postponed']} postponed after a finisher improvement; recovery time "
               f"{recovery['seconds']:.3f}s" + ("; one scheduled intervention did not complete before the run ended"
                                                if recovery["pending"] else ""))
+    stagnation = result.stagnation_report
+    if stagnation and stagnation["enabled"]:
+        print(f"Stagnation restart: {stagnation['restarts']} restart(s) after {len(stagnation['events'])} "
+              f"stagnation MITM request(s) (trigger {stagnation['generations']} generations); seeds "
+              + ", ".join(str(seed) for seed in stagnation["seeds"]))
+        if stagnation["restarts"]:
+            for record in stagnation["attempts"]:
+                first, count = record["first_generation"], record["generations"]
+                span = f"generations {first}-{first + count - 1}" if count else "no generations"
+                ended = "restart" if record["status"] == STATUS_RESTARTED else record["status"]
+                print(f"    attempt {record['attempt']} (seed {record['seed']}, {span}): best "
+                      f"H={record['best_cost']} ({record['objective']}), {record['best_length']} moves"
+                      + (", solved" if record["best_solved"] else "") + f"; ended: {ended}")
     if final.problems:
         for problem in final.problems:
             print(f"CONSISTENCY ERROR: {problem}")
@@ -5226,7 +5583,8 @@ def _print_best_candidate(snapshot):
 def _print_improvement(run, entry):
     """New best-ever state as a coloured cube, plus the two best-ranked move blocks right now."""
     print()
-    print(f">>> New best state in generation {entry.generation} ({run.budget.elapsed():.1f}s): H={entry.cost}, "
+    print(f">>> New best state in generation {run._generation_label(entry.generation)} "
+          f"({run.budget.elapsed():.1f}s): H={entry.cost}, "
           f"{len(entry.active)} moves, found via {entry.source}")
     print(f"    moves: {format_moves(entry.active)}")
     source_block = run.find_block(entry.block_id) if entry.block_id is not None else None
@@ -5506,26 +5864,29 @@ def main(argv=None, *, clock=None, keyboard=None):
     display = DisplayRequests()
     control = (keyboard or KeyboardControl)(requests, display_requests=display)
     previous_handler = _install_sigint(budget)
-    run = None
+    session = None
     forced_stop = False
     try:
         # The key reader only queues requests; the terminal mode is restored on every exit path.
         with control:
             print(control.status_line())  # after setup, so a failed setup is reported as unavailable
-            run = CoevolutionRun(config, input_key, objective, seed, budget=budget,
-                                 on_improvement=_print_improvement, manual_requests=requests,
-                                 display_requests=display, on_display=_print_best_candidate)
-            for line in _library_startup_lines(run):
+            # One session for all attempts: restarts reuse the budget and the key reader's queues.
+            session = SearchSession(config, input_key, objective, seed, budget=budget,
+                                    on_improvement=_print_improvement, manual_requests=requests,
+                                    display_requests=display, on_display=_print_best_candidate)
+            for line in _library_startup_lines(session.run):
                 print(line)
-            print(f"Baseline: H={run.baseline.cost} solved={'yes' if run.baseline.solved else 'no'} (0 moves)")
-            result = run.run()
-            run.report_progress_if_stale()
+            # No local reference to the first run: a restart must be able to release it.
+            baseline = session.run.baseline
+            print(f"Baseline: H={baseline.cost} solved={'yes' if baseline.solved else 'no'} (0 moves)")
+            result = session.execute()
+            session.run.report_progress_if_stale()
     except KeyboardInterrupt:
-        if run is None:
+        if session is None:
             _print_status(STATUS_INTERRUPTED)
             return EXIT_CODES[STATUS_INTERRUPTED]
         forced_stop = True
-        result = run.interrupted_result()
+        result = session.interrupted_result()
     except (ConsistencyError, NumericalError) as exc:
         _print_status(STATUS_ERROR, f"Internal error: {exc}")
         return EXIT_CODES[STATUS_ERROR]
@@ -5539,7 +5900,8 @@ def main(argv=None, *, clock=None, keyboard=None):
     final = finalize_result(result)
     finalization_seconds = time.monotonic() - finalization_started
     # A forced stop keeps only the last checkpoint; a failed replay persists nothing new.
-    result.library_report = run.finish_block_library(allow_save=not forced_stop and final.status != STATUS_ERROR)
+    result.library_report = session.run.finish_block_library(
+        allow_save=not forced_stop and final.status != STATUS_ERROR)
     _print_final(result, final, finalization_seconds)
     if config.plot:
         print(f"Progress plot saved to {save_progress_plot(result.history)}")

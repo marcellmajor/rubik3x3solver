@@ -16,7 +16,7 @@ solution.
 | [solution.py](solution.py) | `Solution`: move-sequence ("chromosome") handling and fitness evaluation used by [solver.py](solver.py). |
 | [solver.py](solver.py) | Hand-rolled solver: exhaustive combination search (single/multi-threaded, multiprocess, meet-in-the-middle), then a mutation/crossover hill-climb. |
 | [solver_deap.py](solver_deap.py) | Earlier DEAP genetic algorithm with hall-of-fame elitism, algorithm-aware mutation, and a fitness plot. Hardcoded parameters, no CLI or tests. |
-| [solver_deap_coevolution.py](solver_deap_coevolution.py) | Main entry point: DEAP cooperative coevolution of solution candidates and evolving move blocks, with a CLI, selectable fitness functions, a persistent block library, diversity checks, the meet-in-the-middle finisher and optional adaptive recovery. |
+| [solver_deap_coevolution.py](solver_deap_coevolution.py) | Main entry point: DEAP cooperative coevolution of solution candidates and evolving move blocks, with a CLI, selectable fitness functions, a persistent block library, diversity checks, the meet-in-the-middle finisher, stagnation restarts and optional adaptive recovery. |
 | [test_solver_deap_coevolution.py](test_solver_deap_coevolution.py) | Deterministic `unittest` suite for the coevolution solver. |
 | [test_mitm_finisher.py](test_mitm_finisher.py) | Tests for the meet-in-the-middle finisher (`--mitm`, on by default). |
 | [test_adaptive_recovery.py](test_adaptive_recovery.py) | Tests for the optional adaptive population recovery (`--adaptive-recovery`). |
@@ -24,6 +24,7 @@ solution.
 | [test_best_candidate_display.py](test_best_candidate_display.py) | Tests for the Space shortcut that shows the current best candidate. |
 | [test_mix_fitness.py](test_mix_fitness.py) | Tests for the scaled five-primitive `mix` fitness. |
 | [test_table_lookup.py](test_table_lookup.py) | Tests for the population-wide solved-side table checks. |
+| [test_stagnation_restart.py](test_stagnation_restart.py) | Tests for the stagnation MITM attempt and full GA restart. |
 | [benchmark_coevolution.py](benchmark_coevolution.py), [experiment_coevolution.txt](experiment_coevolution.txt) | Bounded comparison of the two DEAP solvers, and its recorded report. |
 | [pyproject.toml](pyproject.toml), [uv.lock](uv.lock) | Project metadata, dependencies, and the lockfile used by [uv](https://docs.astral.sh/uv/). |
 
@@ -641,6 +642,71 @@ in 12 runs with recovery or 12 without.
 These runs show no benefit on these cubes; three seeds per cube are not enough
 to measure a small effect either way.
 
+### Stagnation MITM and restart
+
+When the best-ever candidate stops improving, the solver runs one
+meet-in-the-middle attempt from it and, if that search completes without a
+strict improvement, restarts the whole GA with a new seed. It is on
+by default in the CLI; `--no-stagnation-restart` turns it off. Library callers
+opt in with `SearchConfig(stagnation_restart=True)`.
+
+- **Trigger:** `--restart-stagnation-generations` (default 500) completed
+  generations without a strict improvement in the best-ever `H`. An equal `H`
+  with fewer moves does not count. Any strict improvement restarts the count,
+  whether it comes from the GA or from an automatic, manual or stagnation
+  MITM attempt. With `grouped-alternating`, a phase switch also restarts it,
+  because `H` values of different formulas are never compared. This is
+  separate from `--stagnation-generations` (default 100), which only drives
+  the diversity warnings and adaptive recovery.
+- **The attempt:** one MITM search from the best-ever candidate at that
+  generation boundary, at the configured `--mitm-depth`. It ignores the
+  misplaced-cubie trigger, the `--mitm-interval` schedule and same-endpoint
+  suppression, and it runs even with `--no-mitm`, which turns off only the
+  automatic attempts. Depth, the per-attempt and cumulative time limits,
+  Ctrl+C, the solution capacity, shortening and verification are the same as
+  for every attempt. A boundary never runs two forward searches: a pending M
+  request goes first, and the stagnation attempt waits for the next boundary.
+- **Outcomes:**
+  - A verified solve finishes the run normally.
+  - A strict `H` improvement enters the population, the GA continues, and the
+    count restarts at 0.
+  - A search that completed (`exhaustive`), with all its results processed
+    and no strict improvement, restarts the GA. An equal-`H`, shorter
+    candidate does not prevent this. This is the usual bounded search: it
+    rules out a solve within `--mitm-depth` moves, but its fallback
+    improvements come only from the forward half (at most `ceil(D/2)` moves),
+    so it does not prove that no `D`-move improvement exists.
+  - Anything else proves nothing: a timed-out search, results not processed
+    before the deadline, the cumulative finishing time already spent, or a
+    search that stopped early on a solving path it could not use (for
+    example one over the capacity). It is reported, the GA is not restarted,
+    and the next stagnation attempt waits another interval. Ctrl+C,
+    `--time-limit` and errors end the session as usual.
+- **Restart:** a fresh run from the original cube with the same
+  configuration: new solution and block populations (with the usual
+  block-library seeding), archive, counters and recovery state. Nothing is
+  seeded from the previous best. The previous attempt's library submissions
+  are saved first, through the normal verified path. The session ends instead
+  of restarting if that attempt's best candidate fails replay (`ERROR`,
+  nothing saved) or if Ctrl+C or the time limit arrives while the attempt is
+  being finished. Only the attempt's result is kept, not its populations or
+  caches. The new seed is derived
+  from the session seed and the restart number (SHA-256), so a seeded session
+  restarts the same way every time; every seed is logged. The solved-side
+  table and the other lookup tables are reused.
+- **Limits:** `--generations`, `--time-limit` and `--mitm-total-seconds`
+  cover the whole session; a restart never replenishes them. After a restart,
+  progress lines show both counts, for example
+  `[gen 120 of attempt 2, cumulative 1620 | ...]`. M and Space act on the
+  current attempt.
+- **Result:** the final report keeps the best candidate of all attempts,
+  compared under the final objective and verified by replay as usual, so a
+  worse restart cannot hide an earlier result. A last candidate that fails
+  replay is reported as it is, so no earlier result hides that failure
+  either. It lists the restarts, the
+  seeds and each attempt's best `H`; `RunResult.stagnation_report` holds the
+  same data.
+
 ## Benchmark ([benchmark_coevolution.py](benchmark_coevolution.py))
 
 Runs both DEAP solvers on the active checkpoint from `solver_deap.py` for
@@ -677,6 +743,8 @@ uv run python solver_deap_coevolution.py --seed 42 --block-library my_blocks.jso
 uv run python solver_deap_coevolution.py --seed 42 --no-block-library
 uv run python solver_deap_coevolution.py --seed 42 --no-mitm   # no automatic finisher attempts; M still requests one
 uv run python solver_deap_coevolution.py --seed 42 --adaptive-recovery
+uv run python solver_deap_coevolution.py --seed 42 --restart-stagnation-generations 300
+uv run python solver_deap_coevolution.py --seed 42 --no-stagnation-restart
 uv run python -m unittest test_solver_deap_coevolution -v
 uv run python -m unittest test_block_library -v
 uv run python -m unittest test_population_diversity -v
@@ -686,6 +754,7 @@ uv run python -m unittest test_manual_mitm -v
 uv run python -m unittest test_best_candidate_display -v
 uv run python -m unittest test_mix_fitness -v
 uv run python -m unittest test_table_lookup -v
+uv run python -m unittest test_stagnation_restart -v
 uv run python benchmark_coevolution.py   # ~15 minutes
 ```
 
