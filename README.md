@@ -160,7 +160,15 @@ original scramble.
 
 ## Cooperative coevolution solver ([solver_deap_coevolution.py](solver_deap_coevolution.py))
 
-The main entry point, a DEAP solver that evolves two populations together:
+The main entry point, a DEAP solver that evolves two populations together.
+
+> **Recommended settings:** to solve cubes consistently, run with
+> `--fitness mix --mitm --adaptive-recovery`
+> (`--mitm` is already on by default and is listed for clarity). Other
+> combinations of fitness, finisher and recovery options are for
+> experimenting only.
+
+It evolves:
 
 - **Solution candidates** are move sequences applied to the input cube. Each
   candidate is normalised to its best prefix and stored as exactly that
@@ -762,11 +770,14 @@ Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then
 run the solvers from this directory. `uv run` creates `.venv` on first use,
 installs the locked dependencies (`colorama`, `deap`, `numpy`, `matplotlib`),
 and uses the Python in [`.python-version`](.python-version) (3.12), downloading
-that interpreter if it is not already installed.
+that interpreter if it is not already installed. For solving, use the first
+coevolution line below (the recommended settings); the other coevolution
+option combinations are for experimenting only.
 
 ```bash
 uv run python solver_deap.py   # DEAP genetic algorithm
 uv run python solver.py        # needs combinations*.txt, see above
+uv run python solver_deap_coevolution.py --fitness mix --mitm --adaptive-recovery   # recommended for solving
 uv run python solver_deap_coevolution.py --seed 42   # coevolution; --help lists options
 uv run python solver_deap_coevolution.py --fitness cubie-refined --seed 42
 uv run python solver_deap_coevolution.py --fitness grouped-cubie --seed 42
