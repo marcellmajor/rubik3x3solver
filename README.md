@@ -25,6 +25,7 @@ solution.
 | [test_mix_fitness.py](test_mix_fitness.py) | Tests for the scaled five-primitive `mix` fitness. |
 | [test_table_lookup.py](test_table_lookup.py) | Tests for the population-wide solved-side table checks. |
 | [test_stagnation_restart.py](test_stagnation_restart.py) | Tests for the stagnation MITM attempt and full GA restart. |
+| [test_mitm_pattern_trigger.py](test_mitm_pattern_trigger.py) | Tests for the depth-12 pattern-distance trigger of automatic finisher attempts. |
 | [benchmark_coevolution.py](benchmark_coevolution.py), [experiment_coevolution.txt](experiment_coevolution.txt) | Bounded comparison of the two DEAP solvers, and its recorded report. |
 | [pyproject.toml](pyproject.toml), [uv.lock](uv.lock) | Project metadata, dependencies, and the lockfile used by [uv](https://docs.astral.sh/uv/). |
 
@@ -373,6 +374,36 @@ The first attempt in a run builds or loads the solved-side table (see
   checks once after setup and then after completed generations, at most once per
   `--mitm-interval` (50) generations. It only works from the best-ever
   candidate and skips solved endpoints.
+- **Pattern trigger (depth 12 only):** an automatic attempt is also eligible
+  when `P <= --mitm-pattern-trigger` (default 12). `P` is the unweighted sum
+  of the five exact pattern distances (two four-corner and three four-edge
+  groups), read from the `grouped-cubie` tables relative to the face centres.
+  It is not the `grouped-cubie`, `grouped-corners` or `mix` fitness value, and
+  it is the same whatever `--fitness` is selected.
+  - It is combined with the triggers above using OR. Those are checked first,
+    and `P` is computed only when neither of them admits the attempt.
+  - It only decides eligibility. `--no-mitm`, the interval, same-endpoint
+    suppression, the per-attempt, total and session time limits, Ctrl+C, the
+    capacity, shortening and replay verification apply as before. The attempt
+    is an ordinary automatic depth-12 attempt with the usual result handling,
+    and a miss or a timeout does not restart the GA.
+  - `P <= 12` is an experimental closeness heuristic. It is not a lower bound
+    on the solution length and does not guarantee a solution within 12 moves.
+    The threshold is not tuned, and no effect on solve rates is claimed.
+    Attempts can start earlier and use up `--mitm-total-seconds` sooner.
+  - `--mitm-pattern-trigger 0` restores the previous eligibility. At any depth
+    other than 12 the option has no effect.
+  - The first check builds the pattern tables unless the fitness already did
+    (about 1.4 s, once per process).
+  - An admitted attempt logs
+    `[finisher gen N] pattern trigger admits an automatic attempt: P=12 <= 12 at depth 12; ...`,
+    its attempt line says `automatic attempt (pattern trigger: P=12 <= 12)`,
+    and the final report counts these attempts. In each attempt record,
+    `trigger` stays the category (automatic, manual or stagnation), and
+    `eligibility` says which condition admitted an automatic attempt
+    (`misplaced cubies`, `corners-first edges` or `pattern distance`; `None`
+    for manual and stagnation attempts). `pattern_distance` and
+    `pattern_threshold` are set when `P` was computed.
 - **Population table checks:** automatic finishing also looks up every
   candidate's endpoint in the solved-side table. That covers the best-ever
   candidate and every candidate in the published population.
@@ -742,6 +773,7 @@ uv run python solver_deap_coevolution.py --fitness grouped-cubie --seed 42
 uv run python solver_deap_coevolution.py --seed 42 --block-library my_blocks.json
 uv run python solver_deap_coevolution.py --seed 42 --no-block-library
 uv run python solver_deap_coevolution.py --seed 42 --no-mitm   # no automatic finisher attempts; M still requests one
+uv run python solver_deap_coevolution.py --seed 42 --mitm-pattern-trigger 0   # previous finisher eligibility
 uv run python solver_deap_coevolution.py --seed 42 --adaptive-recovery
 uv run python solver_deap_coevolution.py --seed 42 --restart-stagnation-generations 300
 uv run python solver_deap_coevolution.py --seed 42 --no-stagnation-restart
@@ -755,6 +787,7 @@ uv run python -m unittest test_best_candidate_display -v
 uv run python -m unittest test_mix_fitness -v
 uv run python -m unittest test_table_lookup -v
 uv run python -m unittest test_stagnation_restart -v
+uv run python -m unittest test_mitm_pattern_trigger -v
 uv run python benchmark_coevolution.py   # ~15 minutes
 ```
 

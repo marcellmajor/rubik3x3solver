@@ -115,6 +115,11 @@ MITM_MAX_DEPTH = 12  # depths 11-12 need a 6-move table (8.2M states) and far lo
 DEFAULT_MITM_DEPTH = 12
 DEFAULT_MITM_TRIGGER_CUBIES = 4
 DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER = 6
+# Supplementary automatic trigger, at depth 12 only (0 turns it off): the unweighted sum P of the
+# five exact pattern distances is at most this. An experimental closeness heuristic, not a bound
+# on the solution length, and not tuned.
+DEFAULT_MITM_PATTERN_TRIGGER = 12
+MITM_PATTERN_TRIGGER_DEPTH = 12
 DEFAULT_MITM_INTERVAL = 50
 # Caps, not fixed costs: an attempt that finishes or solves earlier returns at once. A complete
 # depth-12 attempt took 59 s (CPython) to 70 s (PyPy) with grouped-cubie on an Apple-silicon Mac,
@@ -1432,6 +1437,7 @@ class SearchConfig:
     mitm_depth: int = DEFAULT_MITM_DEPTH
     mitm_trigger_cubies: int = DEFAULT_MITM_TRIGGER_CUBIES
     mitm_corners_first_edge_trigger: int = DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER
+    mitm_pattern_trigger: int = DEFAULT_MITM_PATTERN_TRIGGER
     mitm_interval: int = DEFAULT_MITM_INTERVAL
     mitm_attempt_seconds: float = DEFAULT_MITM_ATTEMPT_SECONDS
     mitm_total_seconds: float = DEFAULT_MITM_TOTAL_SECONDS
@@ -1494,6 +1500,7 @@ def validate_config(config):
                                ("mitm corners-first edge trigger", config.mitm_corners_first_edge_trigger, 12)):
         if type(value) is not int or not 0 <= value <= upper:
             raise ConfigError(f"{name} must be an integer from 0 to {upper}, got {value!r}")
+    _require_int("mitm pattern trigger", config.mitm_pattern_trigger, 0)
     _require_int("mitm interval", config.mitm_interval, 1)
     for name, value in (("mitm attempt seconds", config.mitm_attempt_seconds),
                         ("mitm total seconds", config.mitm_total_seconds)):
@@ -2330,6 +2337,22 @@ def misplaced_cubies(key):
     return corners, edges
 
 
+def pattern_distance_sum(key):
+    """P: the unweighted sum of the five exact four-piece pattern distances (two corner, three edge groups).
+
+    Uses the grouped-cubie tables and centre-relative decoding, but none of the fitness weights or
+    tie-break tiers, so it is the same whatever the selected fitness. The tables are built on first
+    use (about 1.4 s, once per process). Raises ValueError for an inconsistent or unreachable set
+    of cubies.
+    """
+    return sum(_grouped_cubie_tables().distances(_face_indices(key)))
+
+
+def pattern_trigger_active(config):
+    """Whether the supplementary pattern trigger applies: depth 12 only, and not when set to 0."""
+    return config.mitm_pattern_trigger > 0 and config.mitm_depth == MITM_PATTERN_TRIGGER_DEPTH
+
+
 def default_mitm_cache_dir():
     """``$XDG_CACHE_HOME/rubik3x3solver``, else ``~/.cache/rubik3x3solver``."""
     base = os.environ.get("XDG_CACHE_HOME")
@@ -2654,7 +2677,10 @@ def mitm_search(start_key, table, depth, cost, prefix, capacity, *, check=None, 
 def finisher_summary_line(summary):
     """One line per attempt. A timed-out search never claims the cube is more than D moves away."""
     source = summary["source"] if summary["uid"] is None else f"S#{summary['uid']}, {summary['source']}"
-    line = (f"[finisher gen {summary['generation']}] {summary.get('trigger', 'automatic')} attempt, "
+    admitted = ""
+    if summary.get("eligibility") == "pattern distance":
+        admitted = f" (pattern trigger: P={summary['pattern_distance']} <= {summary['pattern_threshold']})"
+    line = (f"[finisher gen {summary['generation']}] {summary.get('trigger', 'automatic')} attempt{admitted}, "
             f"best-ever ({source}; {summary['active_length']} moves): "
             f"{summary['corners']} corners + {summary['edges']} edges misplaced, H={summary['initial_cost']} | "
             f"depth {summary['depth']} = table {summary['table_depth']} + forward "
@@ -4040,10 +4066,25 @@ class CoevolutionRun:
             except ValueError:
                 corners = edges = None
                 skip = "endpoint cubies not decodable"
-        if skip is None and not (corners + edges <= config.mitm_trigger_cubies or (
-                self.objective.state_function == "corners-first" and corners == 0
-                and edges <= config.mitm_corners_first_edge_trigger)):
-            skip = f"trigger not met: {corners} corners + {edges} edges misplaced"
+        eligibility = pattern = None
+        if skip is None:
+            # The original triggers first; P is computed only when neither admits the attempt.
+            if corners + edges <= config.mitm_trigger_cubies:
+                eligibility = "misplaced cubies"
+            elif (self.objective.state_function == "corners-first" and corners == 0
+                  and edges <= config.mitm_corners_first_edge_trigger):
+                eligibility = "corners-first edges"
+            elif pattern_trigger_active(config):
+                try:
+                    pattern = pattern_distance_sum(entry.endpoint)
+                except ValueError:
+                    pattern = None
+                if pattern is not None and pattern <= config.mitm_pattern_trigger:
+                    eligibility = "pattern distance"
+            if eligibility is None:
+                skip = f"trigger not met: {corners} corners + {edges} edges misplaced"
+                if pattern is not None:
+                    skip += f", pattern sum P={pattern} > {config.mitm_pattern_trigger}"
         cache_key = None if skip else (entry.endpoint, self.objective.identity, self.solution_capacity,
                                        config.mitm_depth)
         if skip is None:
@@ -4058,7 +4099,12 @@ class CoevolutionRun:
             return None
         self.budget.check()  # never start finishing work after an overall stop
         self._finisher_last_attempt = generation
-        return self._finisher_run(generation, entry, cache_key, corners, edges, "automatic", shared_deadline)
+        if eligibility == "pattern distance":
+            self.log(f"[finisher gen {generation}] pattern trigger admits an automatic attempt: "
+                     f"P={pattern} <= {config.mitm_pattern_trigger} at depth {config.mitm_depth}; "
+                     f"{corners} corners + {edges} edges misplaced")
+        return self._finisher_run(generation, entry, cache_key, corners, edges, "automatic", shared_deadline,
+                                  eligibility=eligibility, pattern=pattern)
 
     def finisher_boundary(self, generation):
         """At most one forward attempt per boundary: a pending manual request first, then a due
@@ -4395,14 +4441,22 @@ class CoevolutionRun:
     def _manual_finisher_event(self, generation, status, reason):
         self.manual_finisher_events.append({"generation": generation, "status": status, "reason": reason})
 
-    def _finisher_run(self, generation, entry, cache_key, corners, edges, trigger, shared_deadline=None):
-        """One bounded attempt from ``entry`` (frozen with the current objective for its duration)."""
+    def _finisher_run(self, generation, entry, cache_key, corners, edges, trigger, shared_deadline=None, *,
+                      eligibility=None, pattern=None):
+        """One bounded attempt from ``entry`` (frozen with the current objective for its duration).
+
+        ``trigger`` is the attempt category (automatic, manual, stagnation); ``eligibility`` is the
+        condition that admitted an automatic attempt, and ``pattern`` its P when it was computed.
+        """
         config = self.config
         if self.manual_requests is not None:
             self.manual_requests.begin()  # presses during any attempt are ignored, not queued
         self._finisher_running = True
         remaining = config.mitm_total_seconds - self.finisher_seconds
-        summary = {"generation": generation, "trigger": trigger, "source": entry.source, "uid": entry.uid,
+        summary = {"generation": generation, "trigger": trigger, "eligibility": eligibility,
+                   "pattern_distance": pattern,
+                   "pattern_threshold": None if pattern is None else config.mitm_pattern_trigger,
+                   "source": entry.source, "uid": entry.uid,
                    "active_length": len(entry.active), "corners": corners, "edges": edges,
                    "initial_cost": entry.cost, "depth": config.mitm_depth, "table_depth": config.mitm_depth // 2,
                    "forward_target": config.mitm_depth - config.mitm_depth // 2, "forward_depth": 0, "states": 0,
@@ -4587,7 +4641,8 @@ class CoevolutionRun:
                 "manual_events": list(self.manual_finisher_events),
                 "lookup_passes": list(self.lookup_passes),
                 "seconds": self.finisher_seconds, "preparation_seconds": self.finisher_preparation_seconds,
-                "table_source": self.finisher_table_source}
+                "table_source": self.finisher_table_source, "pattern_trigger": self.config.mitm_pattern_trigger,
+                "pattern_trigger_active": pattern_trigger_active(self.config)}
 
     # -- persistent block library (persistent_move_block_library_specs.md) ---------------
 
@@ -5279,7 +5334,8 @@ def build_arg_parser():
                                f"(default {DEFAULT_RECOVERY_BLOCK_REFRESH_FRACTION})")
     finisher = parser.add_argument_group(
         "meet-in-the-middle finisher",
-        "Exact search from the best-ever candidate when few cubies are misplaced: a solved-side "
+        "Exact search from the best-ever candidate when few cubies are misplaced (or, at depth 12, when the "
+        "pattern sum is at most --mitm-pattern-trigger): a solved-side "
         "table to floor(D/2) moves joined with a forward search to ceil(D/2) moves. Automatic "
         "finishing also checks every candidate in the population against the table (an exact "
         "lookup within floor(D/2) moves, no misplaced-cubie trigger) every --mitm-interval "
@@ -5301,6 +5357,11 @@ def build_arg_parser():
                           default=DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER,
                           help="with --fitness corners-first, also attempt once all corners are home and at most "
                                f"this many edges are misplaced (default {DEFAULT_MITM_CORNERS_FIRST_EDGE_TRIGGER})")
+    finisher.add_argument("--mitm-pattern-trigger", type=int, default=DEFAULT_MITM_PATTERN_TRIGGER,
+                          help=f"at --mitm-depth {MITM_PATTERN_TRIGGER_DEPTH} only, also attempt when the sum P of "
+                               "the five exact pattern distances (two corner and three edge groups) is at most this; "
+                               "an experimental closeness heuristic, not a bound; 0 turns it off "
+                               f"(default {DEFAULT_MITM_PATTERN_TRIGGER})")
     finisher.add_argument("--mitm-interval", type=int, default=DEFAULT_MITM_INTERVAL,
                           help=f"minimum completed generations between attempts (default {DEFAULT_MITM_INTERVAL})")
     finisher.add_argument("--mitm-attempt-seconds", type=float, default=DEFAULT_MITM_ATTEMPT_SECONDS,
@@ -5363,6 +5424,7 @@ def config_from_args(args):
         mitm_depth=args.mitm_depth,
         mitm_trigger_cubies=args.mitm_trigger_cubies,
         mitm_corners_first_edge_trigger=args.mitm_corners_first_edge_trigger,
+        mitm_pattern_trigger=args.mitm_pattern_trigger,
         mitm_interval=args.mitm_interval,
         mitm_attempt_seconds=args.mitm_attempt_seconds,
         mitm_total_seconds=args.mitm_total_seconds,
@@ -5441,6 +5503,9 @@ def _print_startup(config, objective, seed, seed_generated, input_cube):
               f"attempt at <={config.mitm_trigger_cubies} misplaced cubies"
               + (f" or corners home and <={config.mitm_corners_first_edge_trigger} edges"
                  if objective.state_function == "corners-first" else "")
+              + (f" or pattern sum P<={config.mitm_pattern_trigger} (experimental)" if pattern_trigger_active(config)
+                 else f" (pattern trigger: depth {MITM_PATTERN_TRIGGER_DEPTH} only, inactive)"
+                 if config.mitm_pattern_trigger else "")
               + f", every >={config.mitm_interval} generations; plus exact table checks of the whole "
               f"population (within {depth // 2} moves, no misplaced-cubie trigger) every {config.mitm_interval} "
               f"generations; {config.mitm_attempt_seconds:g}s per boundary, "
@@ -5493,8 +5558,10 @@ def _print_final(result, final, finalization_seconds):
     report = result.finisher_report
     if report and (report["enabled"] or report["attempts"] or report["manual_events"]):
         attempts = report["attempts"]
-        print(f"Finisher: {len(attempts)} attempt(s) ({report['manual_attempts']} manual), finishing time "
-              f"{report['seconds']:.2f}s (table preparation {report['preparation_seconds']:.2f}s, "
+        by_pattern = sum(1 for attempt in attempts if attempt.get("eligibility") == "pattern distance")
+        pattern_text = f", {by_pattern} admitted by the pattern trigger" if by_pattern else ""
+        print(f"Finisher: {len(attempts)} attempt(s) ({report['manual_attempts']} manual{pattern_text}), "
+              f"finishing time {report['seconds']:.2f}s (table preparation {report['preparation_seconds']:.2f}s, "
               f"table {report['table_source'] or 'not prepared'})")
         unrun = [event for event in report["manual_events"] if event["status"] != "started"]
         for event in unrun:
