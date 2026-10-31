@@ -840,11 +840,12 @@ script you run, keeping exactly nine stickers of each colour —
 - `solver.py` and `solver_deap.py` use hardcoded inputs and parameters, with
   no arguments or tests. The coevolution solver has a CLI and tests but still
   starts from a hardcoded input cube. Dependencies are installed with uv.
-- The coevolution solver solves short scrambles (up to about 6 moves in
-  testing) but did not get past the active checkpoint's plateau in the
-  benchmark. On the scrambled default, with 2000 solutions and 1000 blocks, it
-  typically reached `H` 60–80 within 30 generations and then stalled; none of
-  those test runs solved it.
+- The coevolution solver solves scrambled cubes consistently only with the
+  recommended settings (`--fitness mix --mitm --adaptive-recovery`); other
+  option combinations are for experimenting and can stall on a plateau. Runs
+  are stochastic, and no solve rate or run time has been recorded. The
+  recorded benchmark (no progress on the near-solved checkpoint) predates the
+  meet-in-the-middle finisher, the `mix` fitness and stagnation restarts.
 - Fitness is a heuristic, not an admissible bound: search can stall at local
   optima and solutions are neither guaranteed nor minimal.
 - Exhaustive modes materialise every combination in memory/on disk and do
