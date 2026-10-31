@@ -8,6 +8,33 @@ is research code, not a general-purpose solver: inputs are hardcoded, only the
 coevolution solver has a CLI, and no search guarantees an optimal (or any)
 solution.
 
+## The search landscape
+
+![Conceptual 3D landscape: broken-up plateaus and cliffs, false summits for "first two layers solved" and "one face solved", and the solved cube as a narrow needle in a hollow](search_landscape.png)
+
+A conceptual sketch, not a measurement: height is heuristic fitness (how
+solved the cube looks), and the ground squashes all 4.3×10¹⁹ positions onto a
+plane. Under the counters these solvers score with, the landscape is nothing
+like smooth terrain:
+
+- **Cliffs**: one quarter-turn moves 20 stickers (8 on the turning face, 12 on
+  its neighbours), so a single gene can wreck a solved face, and positions one
+  move apart can score very differently.
+- **Plateaus**: many moves leave the score unchanged (turning the last layer
+  once the first two are solved, for example), so selection has no slope to
+  follow.
+- **False summits**: "first two layers solved" or "one face solved" score
+  high, but every route from there to the solved cube breaks that progress
+  first.
+- **A needle**: every position one turn from solved already looks fairly
+  scrambled, so nothing nearby slopes up to the goal.
+
+The flat picture also hides how small the space is in moves: each position
+has 18 neighbours (6 directions × 3 counts), and none is more than 20 moves
+from solved. That is why the coevolution solver evolves reusable move blocks
+and hands near-solutions to a meet-in-the-middle finisher instead of relying
+on hill-climbing alone.
+
 ## Layout
 
 | File | Role |
